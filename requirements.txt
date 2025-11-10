@@ -3,3 +3,7 @@ pillow-heif
 send2trash
 opencv-python
 numpy
+pandas
+PyQt6
+
+
