@@ -5,5 +5,5 @@ opencv-python
 numpy
 pandas
 PyQt6
-
+piexif
 
