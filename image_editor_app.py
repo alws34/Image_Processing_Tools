@@ -27,6 +27,7 @@ from PyQt6.QtCore import (
     Qt, QSize, QPoint, QRect, pyqtSignal, QDir, QTimer,
     QThreadPool, QRunnable, QObject, QEvent
 )
+from PyQt6.QtWidgets import QAbstractItemView, QAbstractScrollArea
 
 # PIL
 from PIL import Image, ImageOps, ImageEnhance
@@ -94,7 +95,7 @@ MODE_CROP = 1
 FILL_KEEP = "keep"        # keep borders (letterbox)
 FILL_AUTOCROP = "crop"    # auto-crop valid area
 FILL_STRETCH = "stretch"  # stretch valid area to fill canvas (requested)
-
+LEFT_PANEL_WIDTH = 320 # px
 # ---------------------- Utility ----------------------
 
 def _fmt_ts_local(ts: float) -> str:
@@ -1285,53 +1286,53 @@ class ImageEditorApp(QMainWindow):
 
     # ---------- UI ----------
 
-    def _on_photos_splitter_moved(self, pos: int, index: int):
-        # Prevent re-entrancy jitter
-        if getattr(self, "_in_splitter_handler", False):
-            return
-        self._in_splitter_handler = True
+    # def _on_photos_splitter_moved(self, pos: int, index: int):
+    #     # Prevent re-entrancy jitter
+    #     if getattr(self, "_in_splitter_handler", False):
+    #         return
+    #     self._in_splitter_handler = True
         
-        # Define a minimum size for the left panel (e.g., 20 pixels)
-        # This prevents the auto-collapse to 0.
-        MIN_LEFT_SIZE = 20 
+    #     # Define a minimum size for the left panel (e.g., 20 pixels)
+    #     # This prevents the auto-collapse to 0.
+    #     MIN_LEFT_SIZE = 20 
         
-        try:
-            sizes = self._photos_splitter.sizes()
-            if not sizes or len(sizes) < 2:
-                return
+    #     try:
+    #         sizes = self._photos_splitter.sizes()
+    #         if not sizes or len(sizes) < 2:
+    #             return
                 
-            left, right = sizes[0], sizes[1]
-            total = max(1, left + right)
+    #         left, right = sizes[0], sizes[1]
+    #         total = max(1, left + right)
 
-            # --- REPLACING THE ORIGINAL COLLAPSE LOGIC ---
-            # The original code: 
-            # if left <= self._left_auto_collapse_px and left != 0:
-            #     self._photos_splitter.setSizes([0, total]) 
-            #     return
+    #         # --- REPLACING THE ORIGINAL COLLAPSE LOGIC ---
+    #         # The original code: 
+    #         # if left <= self._left_auto_collapse_px and left != 0:
+    #         #     self._photos_splitter.setSizes([0, total]) 
+    #         #     return
             
-            # 1. Prevent collapse to 0 by forcing a minimum size
-            if left < MIN_LEFT_SIZE and left != 0:
-                left = MIN_LEFT_SIZE
-                right = max(1, total - left)
-                self._photos_splitter.setSizes([left, right])
-                return 
+    #         # 1. Prevent collapse to 0 by forcing a minimum size
+    #         if left < MIN_LEFT_SIZE and left != 0:
+    #             left = MIN_LEFT_SIZE
+    #             right = max(1, total - left)
+    #             self._photos_splitter.setSizes([left, right])
+    #             return 
                 
-            # 2. Original RESTORE logic (only runs if left == 0)
-            # This only needs to run if something else is still collapsing it, 
-            # or if the user is dragging from an initial collapsed state.
-            if left == 0 and pos > self._left_auto_collapse_px:
-                restore = self._last_split_sizes if hasattr(self, "_last_split_sizes") else [280, max(1, total - 280)]
-                # Ensure it sums to total
-                scale = total / max(1, sum(restore))
-                restore_scaled = [max(1, int(r * scale)) for r in restore]
-                # Fix rounding drift
-                drift = total - sum(restore_scaled)
-                restore_scaled[0] += drift
-                self._photos_splitter.setSizes(restore_scaled)
-                return
+    #         # 2. Original RESTORE logic (only runs if left == 0)
+    #         # This only needs to run if something else is still collapsing it, 
+    #         # or if the user is dragging from an initial collapsed state.
+    #         if left == 0 and pos > self._left_auto_collapse_px:
+    #             restore = self._last_split_sizes if hasattr(self, "_last_split_sizes") else [280, max(1, total - 280)]
+    #             # Ensure it sums to total
+    #             scale = total / max(1, sum(restore))
+    #             restore_scaled = [max(1, int(r * scale)) for r in restore]
+    #             # Fix rounding drift
+    #             drift = total - sum(restore_scaled)
+    #             restore_scaled[0] += drift
+    #             self._photos_splitter.setSizes(restore_scaled)
+    #             return
 
-        finally:
-            self._in_splitter_handler = False
+    #     finally:
+    #         self._in_splitter_handler = False
     
 
     def _on_crop_mode_changed(self, mode: str):
@@ -1390,8 +1391,25 @@ class ImageEditorApp(QMainWindow):
         lv.addWidget(self.scan_status_lbl)
 
         self.photo_list = QListWidget()
-        self.photo_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.photo_list.currentItemChanged.connect(self._on_photo_select)
+        left.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        left.setFixedWidth(LEFT_PANEL_WIDTH)  # <- locks the sidebar width
+
+        self.photo_list.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.photo_list.setMinimumWidth(LEFT_PANEL_WIDTH)
+        self.photo_list.setMaximumWidth(LEFT_PANEL_WIDTH)  # <- list never widens
+
+        # Do not grow/shrink with content; always scroll instead
+        self.photo_list.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
+        self.photo_list.setWordWrap(False)
+        self.photo_list.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.photo_list.setUniformItemSizes(True)
+
+        # Always show scrollbars; allow horizontal scrolling for long lines
+        self.photo_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.photo_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.photo_list.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+
         lv.addWidget(self.photo_list)
         split.addWidget(left)
 
@@ -1640,8 +1658,8 @@ class ImageEditorApp(QMainWindow):
         self._photos_splitter = split
         self._photos_splitter.setCollapsible(0, False)
         self._left_auto_collapse_px = 200
-        split.splitterMoved.connect(self._on_photos_splitter_moved)
-        split.setSizes([280, 1020])
+        # split.splitterMoved.connect(self._on_photos_splitter_moved)
+        # split.setSizes([280, 1020])
 
         self.single_viewer.clear_pixmap()
 
