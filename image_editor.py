@@ -406,17 +406,12 @@ class ImageEditorApp(QMainWindow):
                 )
                 return
 
-            if getattr(self, "duplicate_groups", None):
-                # Optional: confirm re-scan
-                reply = QMessageBox.question(
-                    self,
-                    "Rescan duplicates",
-                    "A duplicate scan already exists. Run again?",
-                    QMessageBox.StandardButton.Yes
-                    | QMessageBox.StandardButton.No,
-                )
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
+            # Always reset previous results when starting a new scan
+            self.duplicate_groups = []
+            if hasattr(self, "dup_groups_list"):
+                self.dup_groups_list.clear()
+            if hasattr(self, "_clear_duplicate_thumbnails"):
+                self._clear_duplicate_thumbnails()
 
             self.dup_status_lbl.setText(
                 "Scanning for duplicates... this may take a while."
@@ -428,7 +423,6 @@ class ImageEditorApp(QMainWindow):
             try:
                 # Create finder once if not already created
                 if not hasattr(self, "_duplicate_finder"):
-                    # Use defaults; adjust inside duplicates.py if needed
                     self._duplicate_finder = DuplicateFinder()
 
                 # Run the actual duplicate search
@@ -440,14 +434,12 @@ class ImageEditorApp(QMainWindow):
 
                 # Update UI
                 self.dup_groups_list.clear()
-                if hasattr(self, "_clear_duplicate_thumbnails"):
-                    self._clear_duplicate_thumbnails()
+                self._clear_duplicate_thumbnails()
 
                 if not self.duplicate_groups:
                     self.dup_status_lbl.setText("No duplicate groups found.")
                 else:
                     for idx, group in enumerate(self.duplicate_groups):
-                        # Assume DuplicateRecord has 'path' attribute
                         try:
                             first_path = Path(group[0].path)
                             folder_name = first_path.parent.name
@@ -475,6 +467,9 @@ class ImageEditorApp(QMainWindow):
             finally:
                 QApplication.restoreOverrideCursor()
                 self.dup_scan_button.setEnabled(True)
+
+        self.dup_scan_button.clicked.connect(_run_duplicate_scan)
+
 
         self.dup_scan_button.clicked.connect(_run_duplicate_scan)
    
