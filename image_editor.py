@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 from typing import Optional, Any, Tuple, List, Dict
 from datetime import datetime
+import shutil
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -26,6 +27,7 @@ from PyQt6.QtWidgets import (
     QRadioButton,
     QButtonGroup,
     QFrame,
+    QComboBox,
     QScrollArea,
     QSizePolicy,
     QMessageBox,
@@ -51,6 +53,7 @@ from PyQt6.QtCore import (
     QDir,
     QTimer,
     QThreadPool,
+    QEvent,
 )
 
 from common import (
@@ -94,7 +97,7 @@ class ImageEditorApp(QMainWindow):
         self.current_folder: Optional[Path] = None
 
         self.duplicate_groups: List[List[DuplicateRecord]] = []
-        
+
         self.image_files: List[str] = []
         self.current_image_index: int = -1
         self.original_image_path: Optional[str] = None
@@ -139,7 +142,9 @@ class ImageEditorApp(QMainWindow):
         self.total_frames = 0
         self.current_frame_idx = 0
         self.is_playing = False
-
+        self.image_meta: Dict[str, Dict[str, str]] = {}
+        self.mov_meta: Dict[str, Dict[str, str]] = {}
+        
         self._mirror_on = False
 
         self._all_sliders: List[QSlider] = []
@@ -156,7 +161,16 @@ class ImageEditorApp(QMainWindow):
         self._preview_timer.timeout.connect(self._start_preview_job)
         self._preview_lock = threading.Lock()
 
+        # will be created in _init_image_window
+        self.image_window: Optional[QWidget] = None
+        self.viewer_stack: Optional[QStackedWidget] = None
+        self.single_viewer: Optional[ImageViewer] = None
+        self.dual_viewer: Optional[DualImageViewer] = None
+        self.single_scroll: Optional[QScrollArea] = None
+
         self._init_ui()
+        self.photo_sort_combo.setCurrentText("Date taken")
+
         self.set_controls_state(False)
 
         self.delete_action = QAction("Delete", self)
@@ -167,6 +181,30 @@ class ImageEditorApp(QMainWindow):
         self.delete_action.triggered.connect(self._on_delete_key)
         self.addAction(self.delete_action)
 
+        self.prev_image_action = QAction("Prev image", self)
+        self.prev_image_action.setShortcut(QKeySequence(Qt.Key.Key_Left))
+        self.prev_image_action.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.prev_image_action.triggered.connect(self._go_prev_image)
+        self.addAction(self.prev_image_action)
+
+        self.next_image_action = QAction("Next image", self)
+        self.next_image_action.setShortcut(QKeySequence(Qt.Key.Key_Right))
+        self.next_image_action.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.next_image_action.triggered.connect(self._go_next_image)
+        self.addAction(self.next_image_action)
+        
+        self.copy_image_action = QAction("Copy image", self)
+        self.copy_image_action.setShortcut(QKeySequence.StandardKey.Copy)
+        self.copy_image_action.setShortcutContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.copy_image_action.triggered.connect(self._copy_current_image)
+        self.addAction(self.copy_image_action)
+        
         if _CV2 is None or _NP is None:
             QMessageBox.warning(
                 self,
@@ -174,6 +212,49 @@ class ImageEditorApp(QMainWindow):
                 "Perspective straighten (X/Y) and some filters require opencv-python and numpy.\n\n"
                 "pip install opencv-python numpy",
             )
+
+    def _copy_current_image(self):
+        """
+        Ctrl+C:
+        - Copies the absolute path of the current image as text.
+        - Also copies the current pixmap (if available) to the clipboard as an image.
+        """
+        if not self.image_files or self.current_image_index < 0:
+            return
+
+        path = self.image_files[self.current_image_index]
+
+        cb = QApplication.clipboard()
+        # Copy text path
+        cb.setText(path)
+
+        # Copy image bitmap if we have it
+        if (
+            self.single_viewer is not None
+            and getattr(self.single_viewer, "current_qpixmap", None)
+        ):
+            cb.setPixmap(self.single_viewer.current_qpixmap)
+
+
+    def _go_prev_image(self):
+        if not self.image_files or self.current_image_index <= 0:
+            return
+        new_idx = self.current_image_index - 1
+        self.photo_list.setCurrentRow(new_idx)
+        # _on_photo_select will handle loading
+
+    def _go_next_image(self):
+        if not self.image_files:
+            return
+        if self.current_image_index < 0:
+            # nothing selected yet -> go to first
+            self.photo_list.setCurrentRow(0)
+            return
+        if self.current_image_index >= len(self.image_files) - 1:
+            return
+        new_idx = self.current_image_index + 1
+        self.photo_list.setCurrentRow(new_idx)
+        # _on_photo_select will handle loading
 
     # ---------- Geometry commit / crop ----------
 
@@ -235,7 +316,8 @@ class ImageEditorApp(QMainWindow):
 
     def _on_crop_mode_changed(self, mode: str):
         self.crop_mode_type = mode
-        self.single_viewer.set_crop_mode_type(mode)
+        if self.single_viewer is not None:
+            self.single_viewer.set_crop_mode_type(mode)
 
     # ---------- UI build ----------
     def _init_ui(self):
@@ -280,6 +362,62 @@ class ImageEditorApp(QMainWindow):
 
         # Tab change handler
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        # Separate window for the image viewer(s)
+        self._init_image_window()
+
+    def _init_image_window(self):
+        """
+        Create a separate top-level window that hosts the image viewer(s).
+        This window can be freely resized independently of the main editor UI.
+        """
+        self.image_window = QWidget()
+        self.image_window.setWindowTitle("Image Viewer")
+        self.image_window.resize(1000, 700)
+
+        layout = QVBoxLayout(self.image_window)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Viewer stack (single / dual)
+        self.viewer_stack = QStackedWidget()
+
+        self.single_viewer = ImageViewer()
+        self.single_viewer.editor_ref = self
+
+        self.single_scroll = QScrollArea()
+        self.single_scroll.setWidgetResizable(True)
+        self.single_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.single_scroll.setWidget(self.single_viewer)
+
+        self.single_scroll.viewport().installEventFilter(self)
+
+        single_holder = QWidget()
+        svl = QVBoxLayout(single_holder)
+        svl.setContentsMargins(0, 0, 0, 0)
+        svl.setSpacing(0)
+        svl.addWidget(self.single_scroll)
+        self.viewer_stack.addWidget(single_holder)
+
+        self.dual_viewer = DualImageViewer()
+        self.viewer_stack.addWidget(self.dual_viewer)
+
+        layout.addWidget(self.viewer_stack)
+
+        # Start with a blank viewer
+        self.single_viewer.clear_pixmap("Drop or open a folder to view images")
+
+        self.image_window.show()
+
+    def eventFilter(self, obj, event):
+        if (
+            self.single_scroll is not None
+            and obj is self.single_scroll.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            # viewport changed -> recompute preview to fit new size
+            self._schedule_preview()
+        return super().eventFilter(obj, event)
 
 
     def _build_duplicates_tab(self, tab: QWidget):
@@ -368,24 +506,6 @@ class ImageEditorApp(QMainWindow):
 
         # -------- Handlers --------
 
-    def _clear_duplicate_thumbnails(self) -> None:
-        """
-        Remove all widgets from the duplicate thumbnails grid layout.
-        Safe to call even before the duplicates tab was fully initialized.
-        """
-        layout = getattr(self, "dup_thumbs_layout", None)
-        if layout is None:
-            return
-
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
-
-
-        # When a group is selected, show its thumbnails
         def _on_group_changed(row: int):
             if not (0 <= row < len(self.duplicate_groups)):
                 if hasattr(self, "_clear_duplicate_thumbnails"):
@@ -396,7 +516,6 @@ class ImageEditorApp(QMainWindow):
 
         self.dup_groups_list.currentRowChanged.connect(_on_group_changed)
 
-        # Run duplicate scan (synchronous; uses current image_files)
         def _run_duplicate_scan():
             if not self.current_folder or not self.image_files:
                 QMessageBox.information(
@@ -421,18 +540,15 @@ class ImageEditorApp(QMainWindow):
             QApplication.processEvents()
 
             try:
-                # Create finder once if not already created
                 if not hasattr(self, "_duplicate_finder"):
                     self._duplicate_finder = DuplicateFinder()
 
-                # Run the actual duplicate search
                 groups = self._duplicate_finder.find_duplicates(
                     self.image_files
                 )
 
                 self.duplicate_groups = groups or []
 
-                # Update UI
                 self.dup_groups_list.clear()
                 self._clear_duplicate_thumbnails()
 
@@ -454,7 +570,6 @@ class ImageEditorApp(QMainWindow):
                     self.dup_status_lbl.setText(
                         f"Found {len(self.duplicate_groups)} duplicate groups."
                     )
-                    # Auto-select first group
                     self.dup_groups_list.setCurrentRow(0)
 
             except Exception as e:
@@ -470,9 +585,22 @@ class ImageEditorApp(QMainWindow):
 
         self.dup_scan_button.clicked.connect(_run_duplicate_scan)
 
+    def _clear_duplicate_thumbnails(self) -> None:
+        """
+        Remove all widgets from the duplicate thumbnails grid layout.
+        Safe to call even before the duplicates tab was fully initialized.
+        """
+        layout = getattr(self, "dup_thumbs_layout", None)
+        if layout is None:
+            return
 
-        self.dup_scan_button.clicked.connect(_run_duplicate_scan)
-   
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
     def _build_photos_tab(self, tab: QWidget):
         layout = QHBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -491,8 +619,38 @@ class ImageEditorApp(QMainWindow):
         self.scan_status_lbl.setStyleSheet("color:#999;")
         lv.addWidget(self.scan_status_lbl)
 
+        # --- Sort controls for photos ---
+        sort_row = QHBoxLayout()
+        sort_row.setContentsMargins(0, 0, 0, 0)
+        sort_row.setSpacing(6)
+
+        sort_label = QLabel("Sort images by:")
+        self.photo_sort_combo = QComboBox()
+        self.photo_sort_combo.addItems(
+            ["Name", "Date taken", "Date modified", "Date created"]
+        )
+
+        self.photo_sort_order_combo = QComboBox()
+        self.photo_sort_order_combo.addItems(["Ascending", "Descending"])
+
+        sort_row.addWidget(sort_label)
+        sort_row.addWidget(self.photo_sort_combo)
+        sort_row.addWidget(self.photo_sort_order_combo)
+        sort_row.addStretch(1)
+
+        lv.addLayout(sort_row)
+
+
         self.photo_list = QListWidget()
         self.photo_list.currentItemChanged.connect(self._on_photo_select)
+                # Apply sorting whenever user changes mode/order
+        self.photo_sort_combo.currentIndexChanged.connect(
+            lambda _: self._apply_photo_sort()
+        )
+        self.photo_sort_order_combo.currentIndexChanged.connect(
+            lambda _: self._apply_photo_sort()
+        )
+
 
         left.setSizePolicy(
             QSizePolicy.Policy.Fixed,
@@ -527,39 +685,26 @@ class ImageEditorApp(QMainWindow):
         lv.addWidget(self.photo_list)
         split.addWidget(left)
 
-        # ----------------- Right panel: viewer + editor -----------------
+        # ----------------- Right panel: editor -----------------
         right = QWidget()
         rv = QVBoxLayout(right)
 
         viewer_editor_split = QSplitter(Qt.Orientation.Vertical)
         rv.addWidget(viewer_editor_split)
 
-        # --- Viewer stack (single / dual) ---
-        self.viewer_stack = QStackedWidget()
-
-        self.single_viewer = ImageViewer()
-        self.single_viewer.editor_ref = self
-
-        self.single_scroll = QScrollArea()
-        self.single_scroll.setWidgetResizable(True)
-        self.single_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.single_scroll.setWidget(self.single_viewer)
-
-        single_holder = QWidget()
-        svl = QVBoxLayout(single_holder)
-        svl.setContentsMargins(0, 0, 0, 0)
-        svl.addWidget(self.single_scroll)
-        self.viewer_stack.addWidget(single_holder)
-
-        self.dual_viewer = DualImageViewer()
-        self.viewer_stack.addWidget(self.dual_viewer)
-
-        viewer_editor_split.addWidget(self.viewer_stack)
+        # Placeholder instead of the viewer; real viewer is in a separate window
+        placeholder = QLabel(
+            "Image viewer is open in a separate window.\n"
+            "Use the Photos list on the left to select an image."
+        )
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet("color:#aaa;")
+        viewer_editor_split.addWidget(placeholder)
 
         # --- Editor tabs ---
         self.editor_widget = QTabWidget()
         viewer_editor_split.addWidget(self.editor_widget)
-        viewer_editor_split.setSizes([700, 340])
+        viewer_editor_split.setSizes([200, 640])
 
         # =====================================================
         # Transform / Save tab
@@ -967,8 +1112,6 @@ class ImageEditorApp(QMainWindow):
         self._photos_splitter.setCollapsible(0, False)
         self._left_auto_collapse_px = 200
 
-        self.single_viewer.clear_pixmap()
-
     def _show_duplicate_group_thumbnails(
         self,
         group: List[DuplicateRecord],
@@ -996,7 +1139,6 @@ class ImageEditorApp(QMainWindow):
             img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             img_label.setToolTip(rec.path)
 
-            # Clicking a thumbnail jumps to that image in Photos tab
             def _make_click_handler(p: str):
                 def handler(event):
                     self._on_duplicate_thumbnail_clicked(p)
@@ -1043,7 +1185,6 @@ class ImageEditorApp(QMainWindow):
         self.photo_list.setCurrentRow(idx)
         # _on_photo_select will handle loading it
 
-
     def _build_live_tab(self) -> QWidget:
         tab = QWidget()
         root = QHBoxLayout(tab)
@@ -1056,6 +1197,28 @@ class ImageEditorApp(QMainWindow):
         left_v = QVBoxLayout(left_panel)
         left_v.setContentsMargins(0, 0, 0, 0)
         left_v.setSpacing(6)
+
+        # --- Sort controls for videos ---
+        live_sort_row = QHBoxLayout()
+        live_sort_row.setContentsMargins(0, 0, 0, 0)
+        live_sort_row.setSpacing(6)
+
+        live_sort_label = QLabel("Sort videos by:")
+        self.live_sort_combo = QComboBox()
+        self.live_sort_combo.addItems(
+            ["Name", "Date taken", "Date modified", "Date created"]
+        )
+
+        self.live_sort_order_combo = QComboBox()
+        self.live_sort_order_combo.addItems(["Ascending", "Descending"])
+
+        live_sort_row.addWidget(live_sort_label)
+        live_sort_row.addWidget(self.live_sort_combo)
+        live_sort_row.addWidget(self.live_sort_order_combo)
+        live_sort_row.addStretch(1)
+
+        left_v.addLayout(live_sort_row)
+
 
         self.live_list = QListWidget()
         self.live_list.setMinimumWidth(200)
@@ -1070,6 +1233,15 @@ class ImageEditorApp(QMainWindow):
             )
         )
         left_v.addWidget(self.live_list)
+
+        # Apply sorting whenever user changes mode/order
+        self.live_sort_combo.currentIndexChanged.connect(
+            lambda _: self._apply_live_sort()
+        )
+        self.live_sort_order_combo.currentIndexChanged.connect(
+            lambda _: self._apply_live_sort()
+        )
+
 
         self.frames_list = QListWidget()
         self.frames_list.setMinimumWidth(200)
@@ -1243,6 +1415,9 @@ class ImageEditorApp(QMainWindow):
         self.mov_files = []
         self._clear_photos_state(reset_lists_only=True)
 
+        self.image_meta = {}
+        self.mov_meta = {}
+
         job = DirScanJob(jid, folder, self)
         job.signals.started.connect(self._on_scan_started)
         job.signals.found_image.connect(self._on_scan_found_image)
@@ -1266,7 +1441,30 @@ class ImageEditorApp(QMainWindow):
             return
         p = Path(path)
         self.image_files.append(path)
-        item_text = self._format_list_item_with_meta(p, taken)
+
+        # Cache metadata for sorting
+        try:
+            date_taken = taken or "-"
+        except Exception:
+            date_taken = "-"
+
+        try:
+            date_modified = _fmt_ts_local(os.path.getmtime(p))
+        except Exception:
+            date_modified = "-"
+
+        try:
+            date_created = _fmt_ts_local(os.path.getctime(p))
+        except Exception:
+            date_created = "-"
+
+        self.image_meta[path] = {
+            "taken": date_taken,
+            "modified": date_modified,
+            "created": date_created,
+        }
+
+        item_text = self._format_list_item_with_meta(p, date_taken)
         self.photo_list.addItem(item_text)
         self.photo_list.item(
             self.photo_list.count() - 1
@@ -1289,8 +1487,7 @@ class ImageEditorApp(QMainWindow):
             self.dup_status_lbl.setText(
                 "Load a folder in Photos tab, then scan."
             )
-            
-            
+
     def _on_scan_found_mov(
         self,
         job_id: int,
@@ -1301,6 +1498,28 @@ class ImageEditorApp(QMainWindow):
             return
         p = Path(path)
         self.mov_files.append(path)
+
+        # Cache metadata for sorting
+        try:
+            date_taken = taken or self._mov_date_taken(p) or "-"
+        except Exception:
+            date_taken = "-"
+
+        try:
+            date_modified = _fmt_ts_local(os.path.getmtime(p))
+        except Exception:
+            date_modified = "-"
+
+        try:
+            date_created = _fmt_ts_local(os.path.getctime(p))
+        except Exception:
+            date_created = "-"
+
+        self.mov_meta[path] = {
+            "taken": date_taken,
+            "modified": date_modified,
+            "created": date_created,
+        }
 
     def _on_scan_finished(
         self,
@@ -1313,16 +1532,25 @@ class ImageEditorApp(QMainWindow):
         self.scan_status_lbl.setText(
             f"Loaded {len(images)} images, {len(movs)} videos from {self.current_folder}"
         )
+
+        # Build Live (.mov) list from cached metadata
         self.live_list.clear()
         if self.mov_files:
             for s in self.mov_files:
                 p = Path(s)
-                taken = self._mov_date_taken(p)
+                meta = self.mov_meta.get(s, {})
+                taken = meta.get("taken") or self._mov_date_taken(p)
                 item_text = self._format_list_item_with_meta(p, taken)
                 self.live_list.addItem(item_text)
                 self.live_list.item(
                     self.live_list.count() - 1
                 ).setToolTip(str(p))
+
+        # Apply current sort preferences after full lists are loaded
+        if hasattr(self, "photo_sort_combo"):
+            self._apply_photo_sort()
+        if hasattr(self, "live_sort_combo"):
+            self._apply_live_sort()
 
     def _on_scan_error(self, job_id: int, msg: str):
         if job_id != self._scan_job_id:
@@ -1396,7 +1624,8 @@ class ImageEditorApp(QMainWindow):
         self._orig_exif = None
         self.crop_area = None
         self._reset_controls(reset_rotation=True, reset_sliders=True)
-        self.single_viewer.set_editor_mode(MODE_VIEW)
+        if self.single_viewer is not None:
+            self.single_viewer.set_editor_mode(MODE_VIEW)
         self.crop_mode_button.setChecked(False)
         self.mirror_mode_button.setChecked(False)
         self._mirror_on = False
@@ -1405,7 +1634,8 @@ class ImageEditorApp(QMainWindow):
             return
         if not self._ensure_heif_plugin_for_path(filepath, "open"):
             self.set_controls_state(False)
-            self.single_viewer.clear_pixmap()
+            if self.single_viewer is not None:
+                self.single_viewer.clear_pixmap()
             return
 
         try:
@@ -1424,13 +1654,21 @@ class ImageEditorApp(QMainWindow):
             )
             self.set_controls_state(True)
             self._update_meta_labels_for_image(Path(filepath))
+
+            # Make sure viewer window is visible when loading an image
+            if self.image_window is not None:
+                self.image_window.showNormal()
+                self.image_window.raise_()
+                self.image_window.activateWindow()
+
             self._schedule_preview()
         except Exception as e:
             QMessageBox.critical(
                 self, "Error", f"Could not process image: {e}"
             )
             self.original_image_path = None
-            self.single_viewer.setText(f"Error loading image: {e}")
+            if self.single_viewer is not None:
+                self.single_viewer.setText(f"Error loading image: {e}")
             self.set_controls_state(False)
 
     def _clear_photos_state(self, reset_lists_only: bool = False):
@@ -1442,8 +1680,9 @@ class ImageEditorApp(QMainWindow):
             self._orig_exif = None
             self.crop_area = None
             self.current_image_index = -1
-            self.single_viewer.clear_pixmap()
-            self.single_viewer.set_editor_mode(MODE_VIEW)
+            if self.single_viewer is not None:
+                self.single_viewer.clear_pixmap()
+                self.single_viewer.set_editor_mode(MODE_VIEW)
             self.crop_mode_button.setChecked(False)
             self.mirror_mode_button.setChecked(False)
             self._mirror_on = False
@@ -1600,8 +1839,17 @@ class ImageEditorApp(QMainWindow):
             label.setText(f"Frame error: {e}")
 
     def _save_selected_frame(self):
+        """
+        Save the currently selected frame from the current .mov into a folder
+        named after the .mov file.
+
+        Example:
+            /videos/clip.mov
+                -> /videos/clip/clip_frame_0005.jpg   (when frame index = 5)
+        """
         if self.cap is None:
             return
+
         current = self.frames_list.currentRow()
         if current < 0:
             QMessageBox.warning(
@@ -1612,17 +1860,25 @@ class ImageEditorApp(QMainWindow):
             return
 
         mov_path = Path(self.mov_files[self.current_mov_index])
-        save_name = f"{mov_path.stem}_img_{current:04d}.jpeg"
-        save_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Frame As",
-            str(mov_path.parent / save_name),
-            "JPEG (*.jpeg *.jpg);;PNG (*.png);;All Files (*.*)",
-        )
-        if not save_path:
+
+        # Folder: same parent as .mov, name = mov stem
+        out_dir = mov_path.parent / mov_path.stem
+        try:
+            out_dir.mkdir(exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Save Frame",
+                f"Could not create output folder:\n{out_dir}\n\nError: {e}",
+            )
             return
 
+        # File name: <mov_stem>_frame_XXXX.jpg
+        frame_name = f"{mov_path.stem}_frame_{current:04d}.jpg"
+        out_path = out_dir / frame_name
+
         try:
+            # Seek to the requested frame and read it
             self.cap.set(_CV2.CAP_PROP_POS_FRAMES, current)
             ok, frame_bgr = self.cap.read()
             if not ok:
@@ -1630,18 +1886,23 @@ class ImageEditorApp(QMainWindow):
                     self, "Save Frame", "Could not read frame."
                 )
                 return
+
             frame_rgb = _CV2.cvtColor(frame_bgr, _CV2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
-            if Path(save_path).suffix.lower() in (".jpg", ".jpeg"):
-                img.save(save_path, "JPEG", quality=90)
-            else:
-                img.save(save_path)
+
+            # Always save as JPEG here (simple, predictable)
+            img.save(str(out_path), "JPEG", quality=90)
+
             QMessageBox.information(
-                self, "Save Frame", f"Saved:\n{save_path}"
+                self,
+                "Save Frame",
+                f"Saved frame to:\n{out_path}",
             )
         except Exception as e:
             QMessageBox.critical(
-                self, "Save Frame", f"Error: {e}"
+                self,
+                "Save Frame",
+                f"Error while saving frame:\n{e}",
             )
 
     def _clear_live_state(self):
@@ -1664,6 +1925,137 @@ class ImageEditorApp(QMainWindow):
         self.save_frame_button.setEnabled(False)
 
     # ---------- Photo controls ----------
+
+    # ---------- Sorting helpers ----------
+
+    def _apply_photo_sort(self):
+        """
+        Sort self.image_files and rebuild the Photos list according to
+        the selected sort mode and order.
+        """
+        if not self.image_files:
+            return
+
+        # Remember currently selected path
+        current_path = None
+        if 0 <= self.current_image_index < len(self.image_files):
+            current_path = self.image_files[self.current_image_index]
+
+        mode = (
+            self.photo_sort_combo.currentText()
+            if hasattr(self, "photo_sort_combo")
+            else "Name"
+        )
+        order = (
+            self.photo_sort_order_combo.currentText()
+            if hasattr(self, "photo_sort_order_combo")
+            else "Ascending"
+        )
+        reverse = (order == "Descending")
+
+        def sort_key(path: str):
+            meta = self.image_meta.get(path, {})
+            if mode == "Name":
+                return Path(path).name.lower()
+            elif mode == "Date taken":
+                return meta.get("taken") or ""
+            elif mode == "Date modified":
+                return meta.get("modified") or ""
+            elif mode == "Date created":
+                return meta.get("created") or ""
+            else:
+                return Path(path).name.lower()
+
+        # Reorder the internal list
+        self.image_files.sort(key=sort_key, reverse=reverse)
+
+        # Rebuild the UI list
+        self.photo_list.blockSignals(True)
+        self.photo_list.clear()
+        for path in self.image_files:
+            p = Path(path)
+            meta = self.image_meta.get(path, {})
+            taken_str = meta.get("taken")
+            item_text = self._format_list_item_with_meta(p, taken_str)
+            self.photo_list.addItem(item_text)
+            self.photo_list.item(
+                self.photo_list.count() - 1
+            ).setToolTip(str(p))
+        self.photo_list.blockSignals(False)
+
+        # Restore selection if possible
+        if current_path and current_path in self.image_files:
+            new_idx = self.image_files.index(current_path)
+            self.current_image_index = new_idx
+            self.photo_list.setCurrentRow(new_idx)
+        elif self.image_files:
+            self.current_image_index = 0
+            self.photo_list.setCurrentRow(0)
+
+    def _apply_live_sort(self):
+        """
+        Sort self.mov_files and rebuild the Live videos list according to
+        the selected sort mode and order.
+        """
+        if not self.mov_files:
+            return
+
+        current_mov_path = None
+        if 0 <= self.current_mov_index < len(self.mov_files):
+            current_mov_path = self.mov_files[self.current_mov_index]
+
+        mode = (
+            self.live_sort_combo.currentText()
+            if hasattr(self, "live_sort_combo")
+            else "Name"
+        )
+        order = (
+            self.live_sort_order_combo.currentText()
+            if hasattr(self, "live_sort_order_combo")
+            else "Ascending"
+        )
+        reverse = (order == "Descending")
+
+        def sort_key(path: str):
+            meta = self.mov_meta.get(path, {})
+            if mode == "Name":
+                return Path(path).name.lower()
+            elif mode == "Date taken":
+                return meta.get("taken") or ""
+            elif mode == "Date modified":
+                return meta.get("modified") or ""
+            elif mode == "Date created":
+                return meta.get("created") or ""
+            else:
+                return Path(path).name.lower()
+
+        self.mov_files.sort(key=sort_key, reverse=reverse)
+
+        # Rebuild Live list UI
+        self.live_list.blockSignals(True)
+        self.live_list.clear()
+        for s in self.mov_files:
+            p = Path(s)
+            meta = self.mov_meta.get(s, {})
+            taken = meta.get("taken") or self._mov_date_taken(p)
+            item_text = self._format_list_item_with_meta(p, taken)
+            self.live_list.addItem(item_text)
+            self.live_list.item(
+                self.live_list.count() - 1
+            ).setToolTip(str(p))
+        self.live_list.blockSignals(False)
+
+        # Restore selection, reload video if needed
+        if current_mov_path and current_mov_path in self.mov_files:
+            new_idx = self.mov_files.index(current_mov_path)
+            self.current_mov_index = new_idx
+            self.live_list.setCurrentRow(new_idx)
+            self._select_live_by_index(new_idx)
+        elif self.mov_files:
+            self.current_mov_index = 0
+            self.live_list.setCurrentRow(0)
+            self._select_live_by_index(0)
+
 
     def _make_preview_source(
         self,
@@ -1825,6 +2217,9 @@ class ImageEditorApp(QMainWindow):
         if not self.original_image_path:
             self.crop_mode_button.setChecked(False)
             return
+        if self.single_viewer is None:
+            self.crop_mode_button.setChecked(False)
+            return
         if checked:
             self.single_viewer.set_editor_mode(MODE_CROP)
             self.crop_mode_button.setText("Exit Crop Mode")
@@ -1835,7 +2230,8 @@ class ImageEditorApp(QMainWindow):
 
     def _toggle_mirror_mode(self, checked: bool):
         self._mirror_on = bool(checked)
-        self.viewer_stack.setCurrentIndex(1 if checked else 0)
+        if self.viewer_stack is not None:
+            self.viewer_stack.setCurrentIndex(1 if checked else 0)
         self._schedule_preview()
 
     def _on_fill_mode_changed(self):
@@ -1850,6 +2246,7 @@ class ImageEditorApp(QMainWindow):
     def apply_crop(self):
         if (
             not self.original_image_path
+            or not self.single_viewer
             or not self.single_viewer.current_qpixmap
         ):
             QMessageBox.warning(
@@ -2218,12 +2615,17 @@ class ImageEditorApp(QMainWindow):
     def _start_preview_job(self):
         if not self.working_image_pil:
             return
-        do_mirror = self.viewer_stack.currentIndex() == 1
-        avail = (
-            self.dual_viewer.left_scroll.viewport().size()
-            if do_mirror
-            else self.single_scroll.viewport().size()
+        do_mirror = (
+            self.viewer_stack is not None
+            and self.viewer_stack.currentIndex() == 1
         )
+        if do_mirror and self.dual_viewer is not None:
+            avail = self.dual_viewer.left_scroll.viewport().size()
+        elif self.single_scroll is not None:
+            avail = self.single_scroll.viewport().size()
+        else:
+            return
+
         cap_w = min(avail.width(), 1280)
         cap_h = min(avail.height(), 1280)
         target_size = (max(1, cap_w), max(1, cap_h))
@@ -2282,181 +2684,221 @@ class ImageEditorApp(QMainWindow):
         mirror_img_obj: object,
     ):
         if job_id != self._preview_job_id:
+            # Stale preview result – a newer job already started
             return
-        main_pm = QPixmap.fromImage(main_img)
-        mirror_pm = (
-            QPixmap.fromImage(mirror_img_obj)
-            if isinstance(mirror_img_obj, QImage)
-            else None
-        )
-        if self.viewer_stack.currentIndex() == 0:
-            self.single_viewer.set_pixmap(main_pm)
-        else:
-            self.dual_viewer.set_pixmaps(main_pm, mirror_pm)
 
-    # ---------- Metadata ----------
+        if main_img is None:
+            return
+
+        pm_main = QPixmap.fromImage(main_img)
+
+        # Are we in mirror mode?
+        do_mirror = (
+            self.viewer_stack is not None
+            and self.viewer_stack.currentIndex() == 1
+        )
+
+        if do_mirror and self.dual_viewer is not None:
+            mirror_pm = None
+            if isinstance(mirror_img_obj, QImage):
+                mirror_pm = QPixmap.fromImage(mirror_img_obj)
+            elif isinstance(mirror_img_obj, QPixmap):
+                mirror_pm = mirror_img_obj
+
+            # Dual viewer: main on the left, mirror on the right
+            try:
+                self.dual_viewer.set_pixmaps(pm_main, mirror_pm)
+            except AttributeError:
+                # Fallback if API is different
+                try:
+                    self.dual_viewer.set_images(pm_main, mirror_pm)
+                except AttributeError:
+                    # As a last resort, just show main in left viewer
+                    if hasattr(self.dual_viewer, "set_left_pixmap"):
+                        self.dual_viewer.set_left_pixmap(pm_main)
+        else:
+            # Single viewer
+            if self.single_viewer is not None:
+                try:
+                    self.single_viewer.set_pixmap(pm_main)
+                except AttributeError:
+                    # Fallback for older API
+                    if hasattr(self.single_viewer, "set_image"):
+                        self.single_viewer.set_image(pm_main)
+
+    # ---------- Metadata note ----------
 
     def _write_custom_note_to_file(self):
         if not self.original_image_path:
             QMessageBox.warning(
-                self, "Metadata", "No image loaded."
-            )
-            return
-        if _PIEXIF is None:
-            QMessageBox.warning(
-                self, "Metadata", "piexif not installed."
-            )
-            return
-        note = self.meta_note_edit.text().strip()
-        if not note:
-            QMessageBox.warning(
-                self, "Metadata", "Please enter a note."
+                self,
+                "Metadata",
+                "No image loaded.",
             )
             return
 
-        p = Path(self.original_image_path)
-        fmt = (
-            (self._orig_format or self._infer_format_from_path(str(p)))
-            or ""
-        ).upper()
-        if fmt not in ("JPEG", "TIFF"):
+        if _PIEXIF is None:
             QMessageBox.warning(
                 self,
                 "Metadata",
-                "Custom note writing is supported only for JPEG/TIFF.",
+                "piexif is not installed.\n\n"
+                "Install with: pip install piexif",
             )
             return
 
+        note = self.meta_note_edit.text().strip()
+        if not note:
+            reply = QMessageBox.question(
+                self,
+                "Clear note?",
+                "Note field is empty.\n\n"
+                "Do you want to clear the existing EXIF note (if any)?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        path = self.original_image_path
         try:
-            if p.exists() and p.stat().st_size > 0:
-                try:
-                    exif_dict = _PIEXIF.load(str(p))
-                except Exception:
-                    exif_dict = {
-                        "0th": {},
-                        "Exif": {},
-                        "1st": {},
-                        "thumbnail": None,
-                    }
+            import piexif  # type: ignore[import-not-found]
+
+            # Load existing EXIF (if any)
+            with Image.open(path) as im:
+                exif_bytes = im.info.get("exif", b"")
+                if exif_bytes:
+                    exif_dict = piexif.load(exif_bytes)
+                else:
+                    exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+
+            # ImageDescription is usually enough (and better supported than UserComment)
+            if note:
+                exif_dict["0th"][piexif.ImageIFD.ImageDescription] = note.encode(
+                    "utf-8", errors="ignore"
+                )
             else:
-                exif_dict = {
-                    "0th": {},
-                    "Exif": {},
-                    "1st": {},
-                    "thumbnail": None,
-                }
+                # Clear the field if it exists
+                exif_dict["0th"].pop(piexif.ImageIFD.ImageDescription, None)
 
-            exif_dict.setdefault("0th", {})
-            exif_dict.setdefault("Exif", {})
-            exif_dict["0th"][
-                _PIEXIF.ImageIFD.ImageDescription
-            ] = note.encode("utf-8", "ignore")
-            exif_dict["Exif"][
-                _PIEXIF.ExifIFD.UserComment
-            ] = b"ASCII\0\0\0" + note.encode("ascii", "ignore")
+            new_exif = piexif.dump(exif_dict)
 
-            exif_bytes = _PIEXIF.dump(exif_dict)
-            _PIEXIF.insert(exif_bytes, str(p))
+            # Save back in-place with updated EXIF
+            tmp_path = Path(path).with_name(f".tmp_meta_{Path(path).name}")
+            with Image.open(path) as im:
+                im.save(str(tmp_path), exif=new_exif)
+            os.replace(str(tmp_path), path)
+
+            # Remember new EXIF so further saves keep it
+            self._orig_exif = new_exif
+
             QMessageBox.information(
                 self,
                 "Metadata",
-                "Custom note written to file metadata.",
+                "Custom note was written to EXIF.",
             )
         except Exception as e:
             QMessageBox.critical(
-                self, "Metadata", f"Failed to write note: {e}"
+                self,
+                "Metadata",
+                f"Failed to write EXIF note:\n{e}",
             )
+            try:
+                if "tmp_path" in locals() and tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
 
-    # ---------- Delete ----------
+    # ---------- Delete current image (move to deleted/) ----------
 
     def _on_delete_key(self):
-        tab_text = self.tabs.tabText(self.tabs.currentIndex())
-        if tab_text == "Photos":
-            idx = self.photo_list.currentRow()
-            if idx >= 0:
-                self._delete_image_by_index(idx)
-            else:
-                QMessageBox.information(
-                    self, "Delete", "Select an image to delete."
-                )
-        elif tab_text == "Live (.mov)":
-            idx = self.live_list.currentRow()
-            if idx >= 0:
-                self._delete_mov_by_index(idx)
-            else:
-                QMessageBox.information(
-                    self, "Delete", "Select a .mov to delete."
-                )
+        """
+        Handle Delete key pressed (global QAction).
 
-    def _require_send2trash(self) -> bool:
-        if _S2T is None:
-            QMessageBox.critical(
-                self,
-                "Delete",
-                "send2trash is not installed. Install it with:\n\npip install send2trash",
-            )
-            return False
-        return True
+        Instead of actually deleting the file from disk, move it into a
+        sibling 'deleted' folder under the same root directory.
 
-    def _confirm_delete(self, path: Path) -> bool:
+        Example:
+            /photos/IMG_0001.JPG --> /photos/deleted/IMG_0001.JPG
+        """
+        if not self.image_files or self.current_image_index < 0:
+            return
+
+        idx = self.current_image_index
+        path_str = self.image_files[idx]
+        path = Path(path_str)
+
+        deleted_dir = path.parent / "deleted"
+        deleted_dir_display = str(deleted_dir)
+
         reply = QMessageBox.question(
             self,
-            "Move to Trash",
-            f"Move to Trash?\n{path}",
+            "Move image to deleted?",
+            f"Move this file into:\n{deleted_dir_display}\n\n{path_str}",
             QMessageBox.StandardButton.Yes
             | QMessageBox.StandardButton.No,
         )
-        return reply == QMessageBox.StandardButton.Yes
-
-    def _delete_image_by_index(self, idx: int):
-        if not (0 <= idx < len(self.image_files)):
+        if reply != QMessageBox.StandardButton.Yes:
             return
-        p = Path(self.image_files[idx])
-        if not self._require_send2trash():
-            return
-        if not self._confirm_delete(p):
-            return
-
-        if self.original_image_path and Path(
-            self.original_image_path
-        ) == p:
-            self.original_image_path = None
-            self.original_image_pil = None
-            self.working_image_pil = None
-            self._preview_source = None
 
         try:
-            _S2T(str(p))
+            deleted_dir.mkdir(exist_ok=True)
+
+            dest = deleted_dir / path.name
+            if dest.exists():
+                # Avoid overwriting: add timestamp suffix
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                dest = deleted_dir / f"{path.stem}_{ts}{path.suffix}"
+
+            shutil.move(str(path), str(dest))
         except Exception as e:
             QMessageBox.critical(
                 self,
                 "Delete",
-                f"Failed to move to Trash:\n{e}",
+                f"Could not move file to deleted folder:\n{path_str}\n\nError: {e}",
             )
             return
 
-        self.image_files.pop(idx)
+        # Remove from list / internal state
+        del self.image_files[idx]
         self.photo_list.takeItem(idx)
 
-        if self.image_files:
-            new_idx = min(idx, len(self.image_files) - 1)
-            self._load_image_by_index(new_idx)
-            self.photo_list.setCurrentRow(new_idx)
-        else:
-            self._clear_photos_state()
-            self.single_viewer.clear_pixmap("No Images Found")
+        # Reset duplicates info – they are stale now
+        self.duplicate_groups = []
+        if hasattr(self, "dup_groups_list"):
+            self.dup_groups_list.clear()
+        if hasattr(self, "dup_thumbs_layout"):
+            self._clear_duplicate_thumbnails()
+        if hasattr(self, "dup_status_lbl"):
+            self.dup_status_lbl.setText(
+                "Load a folder in Photos tab, then scan."
+            )
+
+        if not self.image_files:
+            # No images left
+            self.current_image_index = -1
+            self._clear_photos_state(reset_lists_only=False)
             self.set_controls_state(False)
-
-    def _delete_mov_by_index(self, idx: int):
-        if not (0 <= idx < len(self.mov_files)):
-            return
-        p = Path(self.mov_files[idx])
-        if not self._require_send2trash():
-            return
-        if not self._confirm_delete(p):
             return
 
-        if self.current_mov_index == idx:
+        # Select next image (or previous if we moved the last one)
+        new_idx = min(idx, len(self.image_files) - 1)
+        self.photo_list.setCurrentRow(new_idx)
+        self._load_image_by_index(new_idx)
+
+    # ---------- Tab / window handling ----------
+
+    def _on_tab_changed(self, index: int):
+        current = self.tabs.widget(index)
+
+        # Stop video playback when leaving Live tab
+        if current is not self.live_tab:
+            self._stop_video()
+
+    def closeEvent(self, event):
+        """
+        Ensure background resources are cleaned up when the main window closes.
+        """
+        try:
             self._stop_video()
             if self.cap:
                 try:
@@ -2464,41 +2906,35 @@ class ImageEditorApp(QMainWindow):
                 except Exception:
                     pass
                 self.cap = None
-            self.frames_list.clear()
-            self.player_label.setText("No .mov loaded")
-            self.player_label.setPixmap(QPixmap())
+        except Exception:
+            pass
 
-        try:
-            _S2T(str(p))
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Delete",
-                f"Failed to move to Trash:\n{e}",
-            )
-            return
+        # Close the external viewer window as well
+        if self.image_window is not None:
+            try:
+                self.image_window.close()
+            except Exception:
+                pass
 
-        self.mov_files.pop(idx)
-        self.live_list.takeItem(idx)
+        super().closeEvent(event)
 
-        if self.mov_files:
-            new_idx = min(idx, len(self.mov_files) - 1)
-            self.current_mov_index = -1
-            self.live_list.setCurrentRow(new_idx)
-            self._select_live_by_index(new_idx)
-        else:
-            self._clear_live_state()
 
-    def _on_tab_changed(self, idx: int):
-        if self.tabs.tabText(idx) != "Live (.mov)":
-            self._stop_video()
-        if self.tabs.tabText(idx) == "Photos":
-            self._schedule_preview()
+def main():
+    app = QApplication(sys.argv)
+
+    # High DPI scaling (safe on modern Qt, no-op on some platforms)
+    try:
+        QApplication.setAttribute(
+            Qt.ApplicationAttribute.AA_EnableHighDpiScaling
+        )
+    except Exception:
+        pass
+
+    win = ImageEditorApp()
+    win.show()
+
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    editor = ImageEditorApp()
-    editor.show()
-    sys.exit(app.exec())
-
+    main()
