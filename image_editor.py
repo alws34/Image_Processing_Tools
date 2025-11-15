@@ -368,6 +368,23 @@ class ImageEditorApp(QMainWindow):
 
         # -------- Handlers --------
 
+    def _clear_duplicate_thumbnails(self) -> None:
+        """
+        Remove all widgets from the duplicate thumbnails grid layout.
+        Safe to call even before the duplicates tab was fully initialized.
+        """
+        layout = getattr(self, "dup_thumbs_layout", None)
+        if layout is None:
+            return
+
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+
         # When a group is selected, show its thumbnails
         def _on_group_changed(row: int):
             if not (0 <= row < len(self.duplicate_groups)):
