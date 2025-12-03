@@ -3,7 +3,7 @@
 
 from typing import List
 
-from common import Image, ImageEnhance, _CV2, _NP
+from core.common import Image, ImageEnhance, _CV2, _NP
 
 
 IPHONE_FILTERS: List[str] = [

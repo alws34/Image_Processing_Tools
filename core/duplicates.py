@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Optional, Callable
 
-from common import Image, HEIF_LIKE_EXTS, _HEIF_PLUGIN
+from core.common import Image, HEIF_LIKE_EXTS, _HEIF_PLUGIN
 
 
 @dataclass

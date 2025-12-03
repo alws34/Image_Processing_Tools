@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup, QFrame
 )
 
-from common import MODE_VIEW, MODE_CROP
+from core.common import MODE_VIEW, MODE_CROP
 
 
 class ImageViewer(QLabel):
