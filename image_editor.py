@@ -93,8 +93,10 @@ class ImageEditorApp(QMainWindow):
         self.setWindowTitle("Advanced PyQt6 Image Editor + Live Photo Tool")
         self.setGeometry(100, 100, 1300, 870)
         self.setAcceptDrops(True)
-
+        self._use_external_viewer = False
         self.current_folder: Optional[Path] = None
+        self._selected_duplicate_path: Optional[str] = None
+        self._dup_thumb_widgets: Dict[str, QWidget] = {}
 
         self.duplicate_groups: List[List[DuplicateRecord]] = []
 
@@ -368,18 +370,15 @@ class ImageEditorApp(QMainWindow):
 
     def _init_image_window(self):
         """
-        Create a separate top-level window that hosts the image viewer(s).
-        This window can be freely resized independently of the main editor UI.
+        Initialize the image viewer widgets.
+
+        If self._use_external_viewer is True:
+            - Create a separate top-level window (legacy behavior).
+
+        If False:
+            - Embed the viewer stack into the Photos tab (viewer_host).
         """
-        self.image_window = QWidget()
-        self.image_window.setWindowTitle("Image Viewer")
-        self.image_window.resize(1000, 700)
-
-        layout = QVBoxLayout(self.image_window)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        # Viewer stack (single / dual)
+        # Common viewer stack and viewers
         self.viewer_stack = QStackedWidget()
 
         self.single_viewer = ImageViewer()
@@ -389,7 +388,6 @@ class ImageEditorApp(QMainWindow):
         self.single_scroll.setWidgetResizable(True)
         self.single_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.single_scroll.setWidget(self.single_viewer)
-
         self.single_scroll.viewport().installEventFilter(self)
 
         single_holder = QWidget()
@@ -402,12 +400,39 @@ class ImageEditorApp(QMainWindow):
         self.dual_viewer = DualImageViewer()
         self.viewer_stack.addWidget(self.dual_viewer)
 
-        layout.addWidget(self.viewer_stack)
+        if self._use_external_viewer:
+            # Separate top-level window
+            self.image_window = QWidget()
+            self.image_window.setWindowTitle("Image Viewer")
+            self.image_window.resize(1000, 700)
 
-        # Start with a blank viewer
-        self.single_viewer.clear_pixmap("Drop or open a folder to view images")
+            layout = QVBoxLayout(self.image_window)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+            layout.addWidget(self.viewer_stack)
 
-        self.image_window.show()
+            self.single_viewer.clear_pixmap(
+                "Drop or open a folder to view images"
+            )
+
+            self.image_window.show()
+        else:
+            # Embedded viewer in main window
+            self.image_window = None
+            if hasattr(self, "viewer_host") and self.viewer_host is not None:
+                host_layout = self.viewer_host.layout()
+                if host_layout is not None:
+                    # Remove placeholder if it exists
+                    if getattr(self, "viewer_placeholder", None) is not None:
+                        host_layout.removeWidget(self.viewer_placeholder)
+                        self.viewer_placeholder.deleteLater()
+                        self.viewer_placeholder = None
+
+                    host_layout.addWidget(self.viewer_stack)
+
+            self.single_viewer.clear_pixmap(
+                "Drop or open a folder to view images"
+            )
 
     def eventFilter(self, obj, event):
         if (
@@ -585,6 +610,29 @@ class ImageEditorApp(QMainWindow):
 
         self.dup_scan_button.clicked.connect(_run_duplicate_scan)
 
+    def _set_dup_thumb_selected(self, path: str, selected: bool) -> None:
+        """
+        Apply or clear 'selected' styling on the duplicate thumbnail
+        container for the given image path.
+        """
+        w = self._dup_thumb_widgets.get(path)
+        if w is None:
+            return
+
+        if selected:
+            # Highlight with a border and subtle background
+            w.setStyleSheet(
+                "QWidget { "
+                "border: 2px solid #00bcd4; "
+                "background-color: #1c2833; "
+                "border-radius: 4px; "
+                "} "
+            )
+        else:
+            # Reset to default look
+            w.setStyleSheet("")
+
+
     def _clear_duplicate_thumbnails(self) -> None:
         """
         Remove all widgets from the duplicate thumbnails grid layout.
@@ -600,6 +648,10 @@ class ImageEditorApp(QMainWindow):
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
+
+        # Also clear path -> widget mapping and selection
+        self._dup_thumb_widgets.clear()
+        self._selected_duplicate_path = None
 
     def _build_photos_tab(self, tab: QWidget):
         layout = QHBoxLayout(tab)
@@ -692,19 +744,27 @@ class ImageEditorApp(QMainWindow):
         viewer_editor_split = QSplitter(Qt.Orientation.Vertical)
         rv.addWidget(viewer_editor_split)
 
-        # Placeholder instead of the viewer; real viewer is in a separate window
-        placeholder = QLabel(
-            "Image viewer is open in a separate window.\n"
-            "Use the Photos list on the left to select an image."
+        # Host widget for the image viewer (embedded by default)
+        self.viewer_host = QWidget()
+        host_layout = QVBoxLayout(self.viewer_host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.setSpacing(0)
+
+        # Initial placeholder text until the viewer is created
+        self.viewer_placeholder = QLabel(
+            "Drop or open a folder to view images."
         )
-        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        placeholder.setStyleSheet("color:#aaa;")
-        viewer_editor_split.addWidget(placeholder)
+        self.viewer_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.viewer_placeholder.setStyleSheet("color:#aaa;")
+        host_layout.addWidget(self.viewer_placeholder)
+
+        viewer_editor_split.addWidget(self.viewer_host)
 
         # --- Editor tabs ---
         self.editor_widget = QTabWidget()
         viewer_editor_split.addWidget(self.editor_widget)
         viewer_editor_split.setSizes([200, 640])
+
 
         # =====================================================
         # Transform / Save tab
@@ -1118,15 +1178,17 @@ class ImageEditorApp(QMainWindow):
     ) -> None:
         self._clear_duplicate_thumbnails()
 
-        max_cols = 4
+        max_cols = 3  # Reduced columns slightly to fit larger images
         row = 0
         col = 0
-        thumb_size = 180
+        thumb_size = 320  # INCREASED from 180 to 320
 
         for rec in group:
             pm = QPixmap(rec.path)
             if pm.isNull():
                 continue
+            
+            # Scale the image
             pm = pm.scaled(
                 thumb_size,
                 thumb_size,
@@ -1138,38 +1200,55 @@ class ImageEditorApp(QMainWindow):
             img_label.setPixmap(pm)
             img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             img_label.setToolTip(rec.path)
-
-            def _make_click_handler(p: str):
-                def handler(event):
-                    self._on_duplicate_thumbnail_clicked(p)
-
-                return handler
-
-            img_label.mousePressEvent = _make_click_handler(rec.path)
+            # Remove any borders explicitly from the image label
+            img_label.setStyleSheet("border: none; background: transparent;")
 
             text_label = QLabel(Path(rec.path).name)
             text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            text_label.setStyleSheet("color:#ccc;")
+            text_label.setWordWrap(True) # Allow long names to wrap
+            text_label.setStyleSheet("border: none; background: transparent; color:#ccc; font-weight: bold;")
 
             container = QWidget()
+            # IMPORTANT: Set an Object Name so we can target ONLY this box in CSS
+            container.setObjectName("dupContainer")
+            
             v = QVBoxLayout(container)
-            v.setContentsMargins(0, 0, 0, 0)
+            v.setContentsMargins(8, 8, 8, 8)
             v.setSpacing(4)
             v.addWidget(img_label)
             v.addWidget(text_label)
 
+            # Record mapping from path -> container widget
+            self._dup_thumb_widgets[rec.path] = container
+
+            # If this path is currently selected, re-apply highlight
+            if rec.path == self._selected_duplicate_path:
+                self._set_dup_thumb_selected(rec.path, True)
+
             self.dup_thumbs_layout.addWidget(container, row, col)
+
+            def _make_click_handler(p: str):
+                def handler(event):
+                    self._on_duplicate_thumbnail_clicked(p)
+                return handler
+
+            # Attach click handler to the image label
+            img_label.mousePressEvent = _make_click_handler(rec.path)
+            text_label.mousePressEvent = _make_click_handler(rec.path)
+            # Also attach to the container background
+            container.mousePressEvent = _make_click_handler(rec.path)
 
             col += 1
             if col >= max_cols:
                 col = 0
                 row += 1
-
+   
     def _on_duplicate_thumbnail_clicked(self, path: str) -> None:
         """
         When the user clicks a duplicate thumbnail:
-        - Switch to the Photos tab
-        - Select that image in the list
+        - Load the clicked image into the viewer.
+        - Keep the Photos list selection in sync without changing the tab.
+        - Visually mark the clicked thumbnail as selected.
         """
         try:
             idx = self.image_files.index(path)
@@ -1181,10 +1260,52 @@ class ImageEditorApp(QMainWindow):
             )
             return
 
-        self.tabs.setCurrentWidget(self.photos_tab)
+        # Update the Photos list selection silently so that when the user
+        # switches to the Photos tab later, it is in sync.
+        self.photo_list.blockSignals(True)
         self.photo_list.setCurrentRow(idx)
-        # _on_photo_select will handle loading it
+        self.photo_list.blockSignals(False)
 
+        # Load the image directly without changing the current tab
+        self._load_image_by_index(idx)
+
+        # Update visual selection highlight
+        if self._selected_duplicate_path and \
+           self._selected_duplicate_path != path:
+            self._set_dup_thumb_selected(self._selected_duplicate_path, False)
+
+        self._selected_duplicate_path = path
+        self._set_dup_thumb_selected(path, True)
+
+    def _set_dup_thumb_selected(self, path: str, selected: bool) -> None:
+        """
+        Apply or clear 'selected' styling on the duplicate thumbnail
+        container for the given image path.
+        """
+        w = self._dup_thumb_widgets.get(path)
+        if w is None:
+            return
+
+        if selected:
+            # Highlight with a border and subtle background
+            # We use #dupContainer to ensure the border applies ONLY to the 
+            # outer box, not the labels inside.
+            w.setStyleSheet(
+                "#dupContainer { "
+                "border: 3px solid #00bcd4; "
+                "background-color: #2c3e50; "
+                "border-radius: 6px; "
+                "} "
+            )
+        else:
+            # Reset to default look (optional transparent border to prevent jumping)
+            w.setStyleSheet(
+                "#dupContainer { "
+                "border: 3px solid transparent; "
+                "background-color: transparent; "
+                "border-radius: 6px; "
+                "}"
+            )
     def _build_live_tab(self) -> QWidget:
         tab = QWidget()
         root = QHBoxLayout(tab)
@@ -1656,7 +1777,7 @@ class ImageEditorApp(QMainWindow):
             self._update_meta_labels_for_image(Path(filepath))
 
             # Make sure viewer window is visible when loading an image
-            if self.image_window is not None:
+            if self._use_external_viewer and self.image_window is not None:
                 self.image_window.showNormal()
                 self.image_window.raise_()
                 self.image_window.activateWindow()
@@ -2814,11 +2935,10 @@ class ImageEditorApp(QMainWindow):
         """
         Handle Delete key pressed (global QAction).
 
-        Instead of actually deleting the file from disk, move it into a
-        sibling 'deleted' folder under the same root directory.
-
-        Example:
-            /photos/IMG_0001.JPG --> /photos/deleted/IMG_0001.JPG
+        - Move the current file into a sibling 'deleted' folder.
+        - Update the Photos list.
+        - Update existing duplicate groups so only this file is removed
+          from its group(s). Other duplicates remain.
         """
         if not self.image_files or self.current_image_index < 0:
             return
@@ -2840,6 +2960,7 @@ class ImageEditorApp(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        # Physically move the file
         try:
             deleted_dir.mkdir(exist_ok=True)
 
@@ -2858,29 +2979,82 @@ class ImageEditorApp(QMainWindow):
             )
             return
 
-        # Remove from list / internal state
+        # Remove from Photos internal list and UI
         del self.image_files[idx]
         self.photo_list.takeItem(idx)
 
-        # Reset duplicates info – they are stale now
-        self.duplicate_groups = []
-        if hasattr(self, "dup_groups_list"):
-            self.dup_groups_list.clear()
-        if hasattr(self, "dup_thumbs_layout"):
-            self._clear_duplicate_thumbnails()
-        if hasattr(self, "dup_status_lbl"):
-            self.dup_status_lbl.setText(
-                "Load a folder in Photos tab, then scan."
-            )
+        # Also remove from cached metadata for sorting
+        self.image_meta.pop(path_str, None)
 
+        # --- Update duplicate groups instead of wiping everything ---
+
+        if self.duplicate_groups:
+            removed_path = path_str
+
+            # Remove the deleted path from any groups that contain it,
+            # and drop groups that now have < 2 items.
+            new_groups = []
+            for group in self.duplicate_groups:
+                pruned = [rec for rec in group if rec.path != removed_path]
+                if len(pruned) >= 2:
+                    new_groups.append(pruned)
+
+            self.duplicate_groups = new_groups
+
+            # Rebuild the duplicates groups list UI
+            if hasattr(self, "dup_groups_list"):
+                # Remember previous selection
+                prev_row = self.dup_groups_list.currentRow()
+                self.dup_groups_list.blockSignals(True)
+                self.dup_groups_list.clear()
+
+                for idx_g, group in enumerate(self.duplicate_groups):
+                    try:
+                        first_path = Path(group[0].path)
+                        folder_name = first_path.parent.name
+                    except Exception:
+                        folder_name = "n/a"
+                    item_text = (
+                        f"Group {idx_g + 1}: {len(group)} images "
+                        f"(folder: {folder_name})"
+                    )
+                    self.dup_groups_list.addItem(item_text)
+
+                self.dup_groups_list.blockSignals(False)
+
+                if not self.duplicate_groups:
+                    # No more duplicate groups at all
+                    if hasattr(self, "dup_status_lbl"):
+                        self.dup_status_lbl.setText(
+                            "No duplicate groups remaining."
+                        )
+                    if hasattr(self, "dup_thumbs_layout"):
+                        self._clear_duplicate_thumbnails()
+                else:
+                    # Clamp selection to a valid row
+                    if prev_row < 0:
+                        prev_row = 0
+                    if prev_row >= len(self.duplicate_groups):
+                        prev_row = len(self.duplicate_groups) - 1
+
+                    self.dup_groups_list.setCurrentRow(prev_row)
+                    # Show thumbnails for the newly selected group
+                    self._show_duplicate_group_thumbnails(
+                        self.duplicate_groups[prev_row]
+                    )
+                    if hasattr(self, "dup_status_lbl"):
+                        self.dup_status_lbl.setText(
+                            f"{len(self.duplicate_groups)} duplicate groups remaining."
+                        )
+
+        # --- If no images left at all, clear state ---
         if not self.image_files:
-            # No images left
             self.current_image_index = -1
             self._clear_photos_state(reset_lists_only=False)
             self.set_controls_state(False)
             return
 
-        # Select next image (or previous if we moved the last one)
+        # Otherwise, select the next image (or previous if we moved the last one)
         new_idx = min(idx, len(self.image_files) - 1)
         self.photo_list.setCurrentRow(new_idx)
         self._load_image_by_index(new_idx)
