@@ -27,164 +27,150 @@ from typing import Callable, Iterable, List, Optional, Tuple, Dict
 
 import cv2
 import numpy as np
-
+import os
 from .duplicates import DuplicateRecord
+from PyQt6.QtCore import  QRunnable, pyqtSlot, QObject, pyqtSignal
+from core.common import (
+    Image, ImageOps, ImageEnhance, _CV2, _NP, _HEIF_PLUGIN, _PIEXIF, _S2T, _MEDIAINFO,)
+class VideoDuplicateWorkerSignals(QObject):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(list, str)
 
 
-class VideoDuplicateFinder:
+
+class VideoDuplicateWorker(QRunnable):
     """
-    Efficiently find duplicate videos by sparsely sampling keyframes and
-    clustering videos with identical signatures.
-
-    For each video we:
-        - Grab up to 3 frames: start, middle, and end.
-        - Compute a 64-bit pHash for each frame.
-        - Use the (h_start, h_mid, h_end) tuple as the signature.
-        - Group videos whose full signature matches exactly.
-
-    This is very fast: only ~3 frame decodes per video.
+    Highly Optimized Video Duplicate Finder.
+    
+    Strategy:
+    1. Filter by File Size: Videos with different file sizes cannot be duplicates.
+    2. Filter by Duration: Same size? Check duration.
+    3. Filter by Visual Hash: Extract 1 frame from the MIDDLE of the video,
+       resize to 9x8 grayscale, and compare bits (dHash).
+    
+    This avoids reading the full file or decoding every frame.
     """
+    def __init__(self, video_paths: List[str]):
+        super().__init__()
+        self.video_paths = list(video_paths)
+        self.signals = VideoDuplicateWorkerSignals()
+        self.is_killed = False
 
-    @staticmethod
-    def _compute_frame_phash(frame: np.ndarray) -> Optional[int]:
-        """
-        Compute an image pHash from a BGR frame (OpenCV format).
-
-        Returns:
-            64-bit integer or None if the frame is invalid.
-        """
-        if frame is None or frame.size == 0:
-            return None
-
+    @pyqtSlot()
+    def run(self) -> None:
         try:
-            # Convert BGR -> gray
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            total_files = len(self.video_paths)
+            if total_files < 2:
+                self.signals.finished.emit([], "Not enough videos to scan.")
+                return
 
-            # Resize to a small, fixed size; 32x32 is typical for pHash
-            small = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
+            # --- Step 1: Group by File Size (Instant) ---
+            size_map = {}
+            for idx, path in enumerate(self.video_paths):
+                if self.is_killed: return
+                try:
+                    sz = os.path.getsize(path)
+                    if sz not in size_map: size_map[sz] = []
+                    size_map[sz].append(path)
+                except OSError: pass
+                
+                # Emit progress for the first pass (0-10%)
+                if idx % 10 == 0:
+                    pct = int((idx / total_files) * 10)
+                    self.signals.progress.emit(pct)
 
-            # Convert to float32 for DCT
-            small_f = small.astype("float32")
+            # Filter groups with > 1 item
+            candidates = [paths for paths in size_map.values() if len(paths) > 1]
+            
+            # --- Step 2 & 3: Duration & Visual Hash ---
+            # We only process files that already share a file size
+            final_groups = []
+            
+            total_candidates = sum(len(g) for g in candidates)
+            processed_count = 0
 
-            # 2D DCT
-            dct = cv2.dct(small_f)
+            for group in candidates:
+                if self.is_killed: return
+                
+                # Sub-group by duration
+                duration_map = {}
+                
+                for path in group:
+                    if self.is_killed: return
+                    
+                    # 10% to 100% progress range
+                    processed_count += 1
+                    current_progress = 10 + int((processed_count / max(1, total_candidates)) * 90)
+                    if processed_count % 5 == 0:
+                        self.signals.progress.emit(current_progress)
 
-            # Take the top-left 8x8 block
-            dct_low = dct[:8, :8]
+                    # Get Visual Hash + Duration
+                    # We bundle them to avoid opening the file twice
+                    vid_hash, duration = self._get_video_fingerprint(path)
+                    
+                    if vid_hash is None: continue
 
-            # Use median (excluding DC) as threshold
-            flat = dct_low.flatten()
-            dc = flat[0]
-            rest = flat[1:]
-            thresh = np.median(rest)
+                    # Create a composite key: (Duration, VisualHash)
+                    # We round duration to nearest second to handle minor encoding diffs
+                    key = (round(duration), vid_hash)
+                    
+                    if key not in duration_map: duration_map[key] = []
+                    duration_map[key].append(path)
 
-            bits = dct_low > thresh
+                # Collect duplicates from this size bucket
+                for key, paths in duration_map.items():
+                    if len(paths) > 1:
+                        # Convert to DuplicateRecord
+                        group_records = [DuplicateRecord(p, 0) for p in paths]
+                        final_groups.append(group_records)
 
-            # Pack into 64-bit integer
-            h = 0
-            for bit in bits.flatten():
-                h = (h << 1) | int(bool(bit))
+            msg = f"Found {len(final_groups)} duplicate video groups." if final_groups else "No duplicate videos found."
+            self.signals.finished.emit(final_groups, msg)
 
-            return int(h)
-        except Exception:
-            return None
+        except Exception as e:
+            self.signals.finished.emit([], f"Error scanning videos: {str(e)}")
 
-    @staticmethod
-    def _get_signature_for_video(path: Path) -> Optional[Tuple[int, int, int]]:
+    def _get_video_fingerprint(self, path: str) -> Tuple[Optional[str], float]:
         """
-        Compute the (start, middle, end) pHash signature for a video.
-
-        Returns:
-            Tuple of three ints, or None if we cannot compute at least
-            one valid frame hash.
+        Returns (dHash_string, duration_seconds).
         """
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            return None
-
+        if _CV2 is None: return None, 0.0
         try:
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if frame_count <= 0:
-                # Some containers do not expose frame count reliably.
-                # Fallback: probe a few frames sequentially.
-                indices = [0, 15, 30]
-            else:
-                # Frame indices for start, middle, near end
-                indices = sorted(
-                    set(
-                        [
-                            0,
-                            max(0, frame_count // 2),
-                            max(0, frame_count - 1),
-                        ]
-                    )
-                )
+            cap = _CV2.VideoCapture(path)
+            if not cap.isOpened(): return None, 0.0
 
-            hashes: List[int] = []
-            for idx in indices:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ok, frame = cap.read()
-                if not ok:
-                    hashes.append(-1)
-                    continue
-                h = VideoDuplicateFinder._compute_frame_phash(frame)
-                hashes.append(h if h is not None else -1)
+            frame_count = int(cap.get(_CV2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(_CV2.CAP_PROP_FPS)
+            duration = 0.0
+            if fps > 0: duration = frame_count / fps
 
-            # If all failed, consider the video unusable for hashing
-            if all(h == -1 for h in hashes):
-                return None
-
-            # Ensure we always have exactly 3 entries
-            while len(hashes) < 3:
-                hashes.append(-1)
-
-            return (hashes[0], hashes[1], hashes[2])
-        finally:
+            # Seek to middle frame to avoid black intro/outro
+            target = frame_count // 2
+            cap.set(_CV2.CAP_PROP_POS_FRAMES, target)
+            ret, frame = cap.read()
             cap.release()
 
-    @staticmethod
-    def find_video_duplicates(
-        video_paths: Iterable[str],
-        progress_cb: Optional[Callable[[int], None]] = None,
-    ) -> List[List[DuplicateRecord]]:
-        """
-        Scan the given video files and return groups of duplicates.
+            if not ret or frame is None: return None, 0.0
 
-        Args:
-            video_paths: iterable of filesystem paths to video files.
-            progress_cb: optional function receiving an int percentage [0..100].
+            # dHash Logic
+            # 1. Grayscale
+            gray = _CV2.cvtColor(frame, _CV2.COLOR_BGR2GRAY)
+            # 2. Resize to 9x8
+            small = _CV2.resize(gray, (9, 8))
+            # 3. Compare adjacent pixels
+            # 0 if P[i] < P[i+1], else 1
+            diff = small[:, 1:] > small[:, :-1]
+            # 4. Convert to hex string
+            # Flatten 8x8 boolean array -> 64 bits -> integer -> hex
+            decimal_value = 0
+            for i, val in enumerate(diff.flatten()):
+                if val: decimal_value += 2**i
+            
+            hex_hash = hex(decimal_value)[2:]
+            return hex_hash, duration
 
-        Returns:
-            A list of groups; each group is a list of DuplicateRecord objects.
-            Only groups with more than one file are returned.
-        """
-        paths = [str(p) for p in video_paths]
-        total = len(paths)
-        if total == 0:
-            return []
+        except Exception:
+            return None, 0.0
 
-        # Map from 3-tuple signature -> list[DuplicateRecord]
-        clusters: Dict[Tuple[int, int, int], List[DuplicateRecord]] = {}
-
-        for idx, p in enumerate(paths):
-            sig = VideoDuplicateFinder._get_signature_for_video(Path(p))
-            if sig is None:
-                # Skip unreadable videos
-                if progress_cb is not None:
-                    pct = int(((idx + 1) / total) * 100)
-                    progress_cb(pct)
-                continue
-
-            clusters.setdefault(sig, []).append(
-                DuplicateRecord(path=p, phash=sig[1] if sig[1] != -1 else sig[0])
-            )
-
-            if progress_cb is not None:
-                pct = int(((idx + 1) / total) * 100)
-                progress_cb(pct)
-
-        # Keep only signatures that have more than one file
-        groups: List[List[DuplicateRecord]] = [
-            recs for recs in clusters.values() if len(recs) > 1
-        ]
-        return groups
+    def kill(self):
+        self.is_killed = True
