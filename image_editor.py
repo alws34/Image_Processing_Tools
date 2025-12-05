@@ -328,7 +328,7 @@ class ImageEditorApp(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # Top controls row: status + mode selector + scan button
+        # Top controls row
         controls_row = QHBoxLayout()
         controls_row.setContentsMargins(0, 0, 0, 0)
         controls_row.setSpacing(8)
@@ -344,16 +344,13 @@ class ImageEditorApp(QMainWindow):
 
         # --- Exact Match Checkbox ---
         self.exact_match_cb = QCheckBox("Exact Match (Fast)")
-        self.exact_match_cb.setToolTip(
-            "If checked, finds identical files (byte-for-byte) regardless of visual content.\n"
-            "This is extremely fast."
-        )
+        self.exact_match_cb.setToolTip("Find byte-for-byte identical files.")
         self.exact_match_cb.setChecked(False) 
         controls_row.addWidget(self.exact_match_cb, 0)
 
         self.dup_scan_button = QPushButton("Scan for duplicates")
         self.dup_scan_button.setToolTip("Scan the currently loaded folder.")
-        self.dup_scan_button.setEnabled(False) # Disabled until scan finishes
+        self.dup_scan_button.setEnabled(True) 
         controls_row.addWidget(self.dup_scan_button, 0)
 
         # --- Delete All Button ---
@@ -366,16 +363,14 @@ class ImageEditorApp(QMainWindow):
 
         layout.addLayout(controls_row)
 
-        # Splitter: left (groups list) / right (thumbnails)
+        # Splitter: Groups | Thumbs | Preview
         split = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(split, 1)
 
-        # Left side: duplicate groups list
+        # 1. Left: Groups list
         left = QWidget()
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
-        lv.setSpacing(6)
-
         groups_lbl = QLabel("Duplicate groups:")
         groups_lbl.setStyleSheet("color:#ccc;")
         lv.addWidget(groups_lbl)
@@ -384,64 +379,59 @@ class ImageEditorApp(QMainWindow):
         self.dup_groups_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.dup_groups_list.setUniformItemSizes(True)
         self.dup_groups_list.setAlternatingRowColors(True)
-        self.dup_groups_list.setVerticalScrollMode(
-            QAbstractItemView.ScrollMode.ScrollPerPixel
-        )        
+        self.dup_groups_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)        
         lv.addWidget(self.dup_groups_list, 1)
-
         split.addWidget(left)
 
-        # Right side: thumbnails of selected group
-        right = QWidget()
-        rv = QVBoxLayout(right)
-        rv.setContentsMargins(0, 0, 0, 0)
-        rv.setSpacing(6)
-
-        thumbs_lbl = QLabel("Thumbnails in selected group:")
+        # 2. Middle: Thumbnails
+        middle = QWidget()
+        mv = QVBoxLayout(middle)
+        mv.setContentsMargins(0, 0, 0, 0)
+        thumbs_lbl = QLabel("Select to delete:")
         thumbs_lbl.setStyleSheet("color:#ccc;")
-        rv.addWidget(thumbs_lbl)
+        mv.addWidget(thumbs_lbl)
 
         self.dup_scroll = QScrollArea()
         self.dup_scroll.setWidgetResizable(True)
-
         thumb_container = QWidget()
         self.dup_thumbs_layout = QGridLayout(thumb_container)
         self.dup_thumbs_layout.setContentsMargins(4, 4, 4, 4)
         self.dup_thumbs_layout.setHorizontalSpacing(10)
         self.dup_thumbs_layout.setVerticalSpacing(10)
         self.dup_scroll.setWidget(thumb_container)
-        rv.addWidget(self.dup_scroll, 1)
+        mv.addWidget(self.dup_scroll, 1)
+        split.addWidget(middle)
 
-        split.addWidget(right)
-        
-        # Add Preview Panel
-        preview_panel = QWidget()
-        ppv = QVBoxLayout(preview_panel)
-        ppv.setContentsMargins(0,0,0,0)
-        
-        self.dup_preview_lbl = QLabel("Preview (No selection)")
-        self.dup_preview_lbl.setStyleSheet("color:#ccc;")
-        ppv.addWidget(self.dup_preview_lbl)
+        # 3. Right: Preview Panel
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        prev_lbl = QLabel("Preview (No selection)")
+        prev_lbl.setStyleSheet("color:#ccc;")
+        self.dup_preview_lbl = prev_lbl 
+        rv.addWidget(prev_lbl)
         
         self.dup_preview_scroll = QScrollArea()
         self.dup_preview_scroll.setWidgetResizable(True)
         self.dup_preview_image_lbl = QLabel()
         self.dup_preview_image_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.dup_preview_scroll.setWidget(self.dup_preview_image_lbl)
-        ppv.addWidget(self.dup_preview_scroll)
+        rv.addWidget(self.dup_preview_scroll, 1)
         
-        split.addWidget(preview_panel)
+        split.addWidget(right)
         
         split.setStretchFactor(0, 2)
         split.setStretchFactor(1, 4)
         split.setStretchFactor(2, 4)
 
         def _on_group_changed(row: int):
-            if not (0 <= row < len(self.duplicate_groups)):
-                if hasattr(self, "_clear_duplicate_thumbnails"):
-                    self._clear_duplicate_thumbnails()
+            print(f"[DEBUG] _on_group_changed row={row}")
+            if row < 0 or row >= len(self.duplicate_groups):
+                self._clear_duplicate_thumbnails()
                 return
+            
             group = self.duplicate_groups[row]
+            print(f"[DEBUG] Selected group with {len(group)} items. Updating thumbs...")
             self._show_duplicate_group_thumbnails(group)
 
         self.dup_groups_list.currentRowChanged.connect(_on_group_changed)
@@ -451,25 +441,16 @@ class ImageEditorApp(QMainWindow):
             mode = self.dup_mode_combo.currentText() if hasattr(self, "dup_mode_combo") else "Images"
             exact_match = self.exact_match_cb.isChecked()
 
-            paths_to_scan = []
-            if mode == "Images":
-                if not self.image_files:
-                    QMessageBox.information(
-                        self,
-                        "Duplicates",
-                        "No images found. Please load a folder first.",
-                    )
-                    return
-                paths_to_scan = self.image_files
-            else:
-                if not self.mov_files:
-                    QMessageBox.information(
-                        self,
-                        "Duplicates",
-                        "No videos found. Please load a folder first.",
-                    )
-                    return
-                paths_to_scan = self.mov_files
+            # NEW: collect paths directly from disk, independent of Photos/Live indexing
+            paths_to_scan = self._gather_paths_for_duplicate_scan(mode)
+
+            if not paths_to_scan:
+                QMessageBox.information(
+                    self,
+                    "Duplicates",
+                    f"No {'images' if mode == 'Images' else 'videos'} found in the selected folder."
+                )
+                return
 
             self.duplicate_groups = []
             if hasattr(self, "dup_groups_list"):
@@ -483,10 +464,10 @@ class ImageEditorApp(QMainWindow):
 
             # --- SELECT WORKER ---
             if exact_match:
-                # Use the ultra-fast exact byte matcher
+                print("[DEBUG] Starting ExactDuplicateWorker")
                 worker = ExactDuplicateWorker(paths_to_scan)
             else:
-                # Use the visual matchers
+                print(f"[DEBUG] Starting Visual Worker for {mode}")
                 if mode == "Images":
                     worker = FastDuplicateWorker(paths_to_scan)
                 else:
@@ -496,6 +477,7 @@ class ImageEditorApp(QMainWindow):
                 self.dup_status_lbl.setText(f"Scanning ({mode})... {pct}%")
 
             def on_finished(groups, msg: str):
+                print(f"[DEBUG] Scan finished. Found {len(groups)} groups.")
                 self.duplicate_groups = groups or []
                 self.dup_scan_button.setEnabled(True)
                 self.dup_delete_all_btn.setEnabled(len(self.duplicate_groups) > 0)
@@ -524,134 +506,28 @@ class ImageEditorApp(QMainWindow):
 
         self.dup_scan_button.clicked.connect(_run_duplicate_scan)
 
-    # --- DELETE LOGIC ---
-
-    def _delete_paths(self, paths_to_delete: Set[str]):
+        self.dup_scan_button.clicked.connect(_run_duplicate_scan)
+    
+    def _image_path_to_pixmap(self, path: str, thumb_size: int) -> QPixmap:
         """
-        Generic file deletion method.
-        Moves files to 'deleted' subfolder and updates all UI lists.
+        Load an image using Pillow (with HEIF support) and convert to QPixmap.
+        This keeps behavior consistent with the main editor and avoids relying
+        on Qt image plugins.
         """
-        if not paths_to_delete: return
+        pm = QPixmap()
+        try:
+            # Use the same pipeline as the editor (EXIF transpose etc.)
+            with Image.open(path) as im:
+                im = ImageOps.exif_transpose(im)
+                # Resize to thumbnail size while preserving aspect ratio
+                im.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
+                pm = pil_to_qpixmap(im)
+        except Exception as e:
+            print(f"[WARN] _image_path_to_pixmap failed for {path}: {e}")
+        return pm
 
-        successfully_deleted = []
-        errors = []
-
-        for path_str in paths_to_delete:
-            path = Path(path_str)
-            deleted_dir = path.parent / "deleted"
-            try:
-                deleted_dir.mkdir(exist_ok=True)
-                dest = deleted_dir / path.name
-                if dest.exists():
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    dest = deleted_dir / f"{path.stem}_{ts}{path.suffix}"
-                shutil.move(str(path), str(dest))
-                successfully_deleted.append(path_str)
-            except Exception as e:
-                errors.append((path_str, e))
-
-        if errors:
-            details = "\n".join(f"{p}: {e}" for p, e in errors)
-            QMessageBox.critical(self, "Delete Error", "Some files could not be moved:\n" + details)
-
-        if not successfully_deleted: return
-
-        deleted_set = set(successfully_deleted)
-
-        # 1. Update Image Lists (Photos Tab)
-        indices_to_remove = []
-        for p in deleted_set:
-            try:
-                idx = self.image_files.index(p)
-                indices_to_remove.append(idx)
-            except ValueError: continue
-        indices_to_remove.sort(reverse=True)
-
-        for idx in indices_to_remove:
-            path_str = self.image_files[idx]
-            del self.image_files[idx]
-            if self.photo_list is not None:
-                self.photo_list.takeItem(idx)
-            if hasattr(self, "image_meta"):
-                self.image_meta.pop(path_str, None)
-
-        # 2. Update Video Lists (Live Tab)
-        mov_indices_to_remove = []
-        for p in deleted_set:
-            try:
-                idx = self.mov_files.index(p)
-                mov_indices_to_remove.append(idx)
-            except ValueError: continue
-        mov_indices_to_remove.sort(reverse=True)
-
-        for idx in mov_indices_to_remove:
-            path_str = self.mov_files[idx]
-            del self.mov_files[idx]
-            if self.live_list is not None:
-                self.live_list.takeItem(idx)
-            if hasattr(self, "mov_meta"):
-                self.mov_meta.pop(path_str, None)
-
-        # 3. Update Duplicate Groups
-        if self.duplicate_groups:
-            new_groups = []
-            for group in self.duplicate_groups:
-                pruned = [rec for rec in group if rec.path not in deleted_set]
-                if len(pruned) >= 2:
-                    new_groups.append(pruned)
-            self.duplicate_groups = new_groups
-
-            # Refresh Group List UI
-            if hasattr(self, "dup_groups_list"):
-                self.dup_groups_list.blockSignals(True)
-                self.dup_groups_list.clear()
-                for idx_g, group in enumerate(self.duplicate_groups):
-                    try:
-                        first_path = Path(group[0].path)
-                        folder_name = first_path.parent.name
-                    except Exception:
-                        folder_name = "n/a"
-                    item_text = f"Group {idx_g + 1}: {len(group)} items (folder: {folder_name})"
-                    self.dup_groups_list.addItem(item_text)
-                self.dup_groups_list.blockSignals(False)
-
-            self._clear_duplicate_thumbnails()
-
-            if self.duplicate_groups:
-                # Refresh thumbnails if groups remain
-                if hasattr(self, "dup_groups_list"): 
-                    self.dup_groups_list.setCurrentRow(0)
-                self._show_duplicate_group_thumbnails(self.duplicate_groups[0])
-                if hasattr(self, "dup_status_lbl"): 
-                    self.dup_status_lbl.setText(f"{len(self.duplicate_groups)} duplicate groups remaining.")
-                if hasattr(self, "dup_delete_all_btn"):
-                    self.dup_delete_all_btn.setEnabled(True)
-            else:
-                if hasattr(self, "dup_status_lbl"): 
-                    self.dup_status_lbl.setText("No duplicate groups remaining.")
-                if hasattr(self, "dup_delete_all_btn"):
-                    self.dup_delete_all_btn.setEnabled(False)
-
-        # 4. Clear Selection State
-        if hasattr(self, "_selected_duplicate_paths"):
-            self._selected_duplicate_paths -= deleted_set
-            if self._selected_duplicate_path in deleted_set:
-                self._selected_duplicate_path = None
-
-        # 5. Handle current image display if it was deleted
-        if self.current_image_index != -1 and not self.image_files:
-             # All images gone
-            self.current_image_index = -1
-            self._clear_photos_state(reset_lists_only=False)
-            self.set_controls_state(False)
-        elif self.current_image_index != -1:
-             # Images remain, ensure index is valid
-             self.current_image_index = min(self.current_image_index, len(self.image_files) - 1)
-             if self.photo_list is not None:
-                 self.photo_list.setCurrentRow(self.current_image_index)
-             self._load_image_by_index(self.current_image_index)
-             
     def _show_duplicate_group_thumbnails(self, group: List[DuplicateRecord]) -> None:
+        print("[DEBUG] Generating thumbnails...")
         self._clear_duplicate_thumbnails()
         self.dup_preview_image_lbl.clear()
         self.dup_preview_lbl.setText("Preview (No selection)")
@@ -659,39 +535,53 @@ class ImageEditorApp(QMainWindow):
         max_cols = 3
         row = 0
         col = 0
-        thumb_size = 220 
+        thumb_size = 220
 
         is_video_mode = (self.dup_mode_combo.currentText() == "Videos")
 
         for rec in group:
+            # --- Build pixmap ---
             if is_video_mode:
                 pm = self._video_path_to_pixmap(rec.path, thumb_size)
-                if pm is None:
+                if pm is None or pm.isNull():
+                    # Fallback: solid black placeholder for videos
                     pm = QPixmap(thumb_size, thumb_size)
                     pm.fill(Qt.GlobalColor.black)
             else:
-                pm = QPixmap(rec.path)
-            
-            if pm.isNull() and not is_video_mode: continue
+                # Use Pillow-based loader so HEIC/HEIF/etc work reliably
+                pm = self._image_path_to_pixmap(rec.path, thumb_size)
 
-            if not pm.isNull():
-                pm = pm.scaled(thumb_size, thumb_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            if pm.isNull():
+                print(f"[DEBUG] Skipping thumbnail for {rec.path} - null pixmap")
+                continue
 
+            # Scale to our target size
+            pm = pm.scaled(
+                thumb_size,
+                thumb_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+
+            # --- Image label ---
             img_label = QLabel()
             img_label.setPixmap(pm)
             img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             img_label.setStyleSheet("border: none; background: transparent;")
 
-            # Show Filename AND Parent Folder
+            # --- Text label ---
             p_obj = Path(rec.path)
             file_name = p_obj.name
             parent_folder = p_obj.parent.name
-            
+
             text_label = QLabel(f"{file_name}\n[{parent_folder}]")
             text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             text_label.setWordWrap(True)
-            text_label.setStyleSheet("border: none; background: transparent; color:#ccc; font-size: 11px;")
+            text_label.setStyleSheet(
+                "border: none; background: transparent; color:#ccc; font-size: 11px;"
+            )
 
+            # --- Container widget ---
             container = QWidget()
             container.setObjectName("dupContainer")
             v = QVBoxLayout(container)
@@ -700,17 +590,24 @@ class ImageEditorApp(QMainWindow):
             v.addWidget(img_label)
             v.addWidget(text_label)
 
+            # Track container by path so selection highlighting works
             self._dup_thumb_widgets[rec.path] = container
 
+            # Restore selection state if path was already selected
             if rec.path in self._selected_duplicate_paths:
                 self._set_dup_thumb_selected(rec.path, True)
 
+            # Add to grid
             self.dup_thumbs_layout.addWidget(container, row, col)
 
+            # --- Click handlers (single + multi-select) ---
             def _make_click_handler(p: str):
                 def handler(event):
                     modifiers = event.modifiers()
-                    multi = bool(modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier))
+                    multi = bool(
+                        modifiers
+                        & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)
+                    )
                     self._on_duplicate_thumbnail_clicked(p, multi_select=multi)
                 return handler
 
@@ -723,79 +620,53 @@ class ImageEditorApp(QMainWindow):
                 col = 0
                 row += 1
 
+        # Force UI relayout/update
+        if self.dup_scroll.widget():
+            self.dup_scroll.widget().adjustSize()
+            self.dup_scroll.widget().update()
+        print("[DEBUG] Thumbnails generated and layout updated.")
+
     def _video_path_to_pixmap(self, path: str, thumb_size: int) -> Optional[QPixmap]:
-        """
-        Robust video thumbnail generator.
-        """
-        if _CV2 is None:
-            return None
-        
+        if _CV2 is None: return None
         cap = None
         try:
             cap = _CV2.VideoCapture(path)
-            if not cap.isOpened():
-                return None
-
+            if not cap.isOpened(): return None
             frame_count = int(cap.get(_CV2.CAP_PROP_FRAME_COUNT)) or 0
-            # Grab frame at 20% mark to avoid black intro screens
             target_idx = int(frame_count * 0.2) if frame_count > 10 else 0
-
             cap.set(_CV2.CAP_PROP_POS_FRAMES, target_idx)
             ok, frame_bgr = cap.read()
-            
-            if not ok or frame_bgr is None:
-                return None
-
+            if not ok or frame_bgr is None: return None
             frame_rgb = _CV2.cvtColor(frame_bgr, _CV2.COLOR_BGR2RGB)
             h, w, ch = frame_rgb.shape
             bytes_per_line = ch * w
-            qimg = QImage(
-                frame_rgb.data,
-                w,
-                h,
-                bytes_per_line,
-                QImage.Format.Format_RGB888,
-            )
-            # Create pixmap copy to avoid memory issues with referencing closed data
+            qimg = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             return QPixmap.fromImage(qimg).copy()
-        except Exception:
-            return None
+        except Exception: return None
         finally:
-            if cap:
-                cap.release()
+            if cap: cap.release()
+
     def _on_duplicate_thumbnail_clicked(self, path: str, multi_select: bool = False) -> None:
         """
         Displays the image in the Preview Panel within the duplicates tab.
         Updates selection logic.
-        DOES NOT SWITCH TABS.
         """
-        # 1. Update Preview Panel (Right side)
+        # Update Preview Panel
         is_video = (self.dup_mode_combo.currentText() == "Videos")
-        
         self.dup_preview_lbl.setText(f"Preview: {Path(path).name}")
         
         if is_video:
-            # For video, grab a larger frame
             pm = self._video_path_to_pixmap(path, 800)
             if pm:
-                self.dup_preview_image_lbl.setPixmap(pm.scaled(
-                    self.dup_preview_scroll.size(), 
-                    Qt.AspectRatioMode.KeepAspectRatio, 
-                    Qt.TransformationMode.SmoothTransformation
-                ))
+                self.dup_preview_image_lbl.setPixmap(pm.scaled(self.dup_preview_scroll.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             else:
                 self.dup_preview_image_lbl.setText("Video preview unavailable")
         else:
-            # For image, load normally
             pm = QPixmap(path)
             if not pm.isNull():
-                self.dup_preview_image_lbl.setPixmap(pm.scaled(
-                    self.dup_preview_scroll.size(), 
-                    Qt.AspectRatioMode.KeepAspectRatio, 
-                    Qt.TransformationMode.SmoothTransformation
-                ))
+                self.dup_preview_image_lbl.setPixmap(pm.scaled(self.dup_preview_scroll.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
-        # 2. Handle Multi-selection Logic
+        # Handle Selection
         if multi_select:
             if path in self._selected_duplicate_paths:
                 self._selected_duplicate_paths.remove(path)
@@ -808,8 +679,7 @@ class ImageEditorApp(QMainWindow):
                 self._set_dup_thumb_selected(path, True)
         else:
             for p_sel in list(self._selected_duplicate_paths):
-                if p_sel != path:
-                    self._set_dup_thumb_selected(p_sel, False)
+                if p_sel != path: self._set_dup_thumb_selected(p_sel, False)
             self._selected_duplicate_paths = {path}
             self._selected_duplicate_path = path
             self._set_dup_thumb_selected(path, True)
@@ -1267,13 +1137,67 @@ class ImageEditorApp(QMainWindow):
     def _on_scan_started(self, job_id: int, folder: str):
         if job_id != self._scan_job_id: return
         self.current_folder = Path(folder)
-        # FIX: Reset duplicate state ONCE here, not during every file find
+        
         self.duplicate_groups = []
         if hasattr(self, "dup_groups_list"): self.dup_groups_list.clear()
         if hasattr(self, "dup_thumbs_layout"): self._clear_duplicate_thumbnails()
+        
         if hasattr(self, "dup_status_lbl"): self.dup_status_lbl.setText("Indexing files... (Please wait)")
-        if hasattr(self, "dup_scan_button"): self.dup_scan_button.setEnabled(False)
+        
+        if hasattr(self, "dup_scan_button"): self.dup_scan_button.setEnabled(True)
         if hasattr(self, "dup_delete_all_btn"): self.dup_delete_all_btn.setEnabled(False)
+
+    def _gather_paths_for_duplicate_scan(self, mode: str) -> List[str]:
+        """
+        Collect file paths for duplicates scanning directly from disk.
+
+        - Uses self.current_folder if available, otherwise asks the user.
+        - Skips hidden files and anything under a 'deleted' folder (same rule as DirScanJob).
+        - Filters by SUPPORTED_IMAGE_EXTS / SUPPORTED_LIVE_EXTS based on mode.
+        """
+        root: Optional[Path] = self.current_folder
+
+        if root is None or not root.exists():
+            folder_path = QFileDialog.getExistingDirectory(
+                self,
+                "Select folder to scan for duplicates",
+                QDir.homePath(),
+                options=QFileDialog.Option.ShowDirsOnly,
+            )
+            if not folder_path:
+                return []
+            root = Path(folder_path)
+            self.current_folder = root
+            # Keep the path edit in sync so user sees what we are scanning
+            if hasattr(self, "path_edit"):
+                self.path_edit.setText(str(root))
+
+        paths: List[str] = []
+        is_images = (mode == "Images")
+
+        # Case-insensitive, deterministic ordering
+        for p in sorted(root.rglob("*"), key=lambda x: str(x).lower()):
+            if not p.is_file():
+                continue
+
+            # Skip hidden files (dot files)
+            if p.name.startswith("."):
+                continue
+
+            # Skip any file under a "deleted" folder
+            parts_lower = {part.lower() for part in p.parts}
+            if "deleted" in parts_lower:
+                continue
+
+            ext = p.suffix.lower()
+
+            if is_images and ext in SUPPORTED_IMAGE_EXTS:
+                paths.append(str(p))
+            elif (not is_images) and ext in SUPPORTED_LIVE_EXTS:
+                paths.append(str(p))
+
+        return paths
+
 
     def _on_scan_found_image(self, job_id: int, path: str, taken: str):
         if job_id != self._scan_job_id: return
@@ -1309,14 +1233,12 @@ class ImageEditorApp(QMainWindow):
     def _on_scan_finished(self, job_id: int, images: List[str], movs: List[str]):
         if job_id != self._scan_job_id: return
         
-        # Update Scan Status Label with real count
         count_msg = f"Ready to scan. Found {len(images)} images and {len(movs)} videos."
         if not images and not movs:
             count_msg = "No compatible files found in this folder."
         
         self.scan_status_lbl.setText(f"Loaded {len(images)} images, {len(movs)} videos from {self.current_folder}")
         
-        # Update Duplicate Tab Status
         if hasattr(self, "dup_status_lbl"):
             self.dup_status_lbl.setText(count_msg)
         if hasattr(self, "dup_scan_button"):
@@ -2095,6 +2017,134 @@ class ImageEditorApp(QMainWindow):
             QMessageBox.critical(self, "Metadata", f"Failed to write EXIF note:\n{e}")
             try:
                 if "tmp_path" in locals() and tmp_path.exists(): tmp_path.unlink()
+            except Exception: pass
+
+    # --- DELETE LOGIC ---
+
+    def _delete_paths(self, paths_to_delete: Set[str]):
+        """
+        Generic file deletion method.
+        Moves files to 'deleted' subfolder and updates all UI lists.
+        """
+        if not paths_to_delete: return
+
+        successfully_deleted = []
+        errors = []
+
+        for path_str in paths_to_delete:
+            path = Path(path_str)
+            deleted_dir = path.parent / "deleted"
+            try:
+                deleted_dir.mkdir(exist_ok=True)
+                dest = deleted_dir / path.name
+                if dest.exists():
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    dest = deleted_dir / f"{path.stem}_{ts}{path.suffix}"
+                shutil.move(str(path), str(dest))
+                successfully_deleted.append(path_str)
+            except Exception as e:
+                errors.append((path_str, e))
+
+        if errors:
+            details = "\n".join(f"{p}: {e}" for p, e in errors)
+            QMessageBox.critical(self, "Delete Error", "Some files could not be moved:\n" + details)
+
+        if not successfully_deleted: return
+
+        deleted_set = set(successfully_deleted)
+
+        # Update Image Lists
+        indices_to_remove = []
+        for p in deleted_set:
+            try:
+                idx = self.image_files.index(p)
+                indices_to_remove.append(idx)
+            except ValueError: continue
+        indices_to_remove.sort(reverse=True)
+
+        for idx in indices_to_remove:
+            path_str = self.image_files[idx]
+            del self.image_files[idx]
+            if self.photo_list is not None:
+                self.photo_list.takeItem(idx)
+            if hasattr(self, "image_meta"):
+                self.image_meta.pop(path_str, None)
+
+        # Update Video Lists
+        mov_indices_to_remove = []
+        for p in deleted_set:
+            try:
+                idx = self.mov_files.index(p)
+                mov_indices_to_remove.append(idx)
+            except ValueError: continue
+        mov_indices_to_remove.sort(reverse=True)
+
+        for idx in mov_indices_to_remove:
+            path_str = self.mov_files[idx]
+            del self.mov_files[idx]
+            if self.live_list is not None:
+                self.live_list.takeItem(idx)
+            if hasattr(self, "mov_meta"):
+                self.mov_meta.pop(path_str, None)
+
+        # Update Duplicate Groups
+        if self.duplicate_groups:
+            new_groups = []
+            for group in self.duplicate_groups:
+                pruned = [rec for rec in group if rec.path not in deleted_set]
+                if len(pruned) >= 2:
+                    new_groups.append(pruned)
+            self.duplicate_groups = new_groups
+
+            # Refresh Group List UI
+            if hasattr(self, "dup_groups_list"):
+                self.dup_groups_list.blockSignals(True)
+                self.dup_groups_list.clear()
+                for idx_g, group in enumerate(self.duplicate_groups):
+                    try:
+                        first_path = Path(group[0].path)
+                        folder_name = first_path.parent.name
+                    except Exception:
+                        folder_name = "n/a"
+                    item_text = f"Group {idx_g + 1}: {len(group)} items (folder: {folder_name})"
+                    self.dup_groups_list.addItem(item_text)
+                self.dup_groups_list.blockSignals(False)
+
+            self._clear_duplicate_thumbnails()
+
+            if self.duplicate_groups:
+                if hasattr(self, "dup_groups_list"): 
+                    self.dup_groups_list.setCurrentRow(0)
+                self._show_duplicate_group_thumbnails(self.duplicate_groups[0])
+                if hasattr(self, "dup_status_lbl"): 
+                    self.dup_status_lbl.setText(f"{len(self.duplicate_groups)} duplicate groups remaining.")
+                if hasattr(self, "dup_delete_all_btn"):
+                    self.dup_delete_all_btn.setEnabled(True)
+            else:
+                if hasattr(self, "dup_status_lbl"): 
+                    self.dup_status_lbl.setText("No duplicate groups remaining.")
+                if hasattr(self, "dup_delete_all_btn"):
+                    self.dup_delete_all_btn.setEnabled(False)
+
+        # Update Selection State
+        if hasattr(self, "_selected_duplicate_paths"):
+            self._selected_duplicate_paths -= deleted_set
+            if self._selected_duplicate_path in deleted_set:
+                self._selected_duplicate_path = None
+
+        # Update Current Image Display if deleted
+        if not self.image_files:
+            self.current_image_index = -1
+            self._clear_photos_state(reset_lists_only=False)
+            self.set_controls_state(False)
+        else:
+            try:
+                # If we deleted the current image, find a new valid index
+                new_idx = max(0, min(self.current_image_index, len(self.image_files) - 1))
+                self.current_image_index = new_idx
+                if self.photo_list is not None:
+                    self.photo_list.setCurrentRow(new_idx)
+                self._load_image_by_index(new_idx)
             except Exception: pass
 
     def _on_delete_key(self):

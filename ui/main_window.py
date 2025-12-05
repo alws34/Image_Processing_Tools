@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QPixmap, QImage, QAction, QKeySequence, QCursor
 from PyQt6.QtCore import Qt, QSize, QPoint, QRect, QTimer, QThreadPool, QEvent, QDir, QRunnable, QObject, pyqtSignal, pyqtSlot
-
+import math
 # --- Core Imports ---
 from core.common import (
     Image, ImageOps, ImageEnhance, _CV2, _NP, _HEIF_PLUGIN, _PIEXIF, _S2T, _MEDIAINFO,
@@ -36,6 +36,165 @@ from workers.tasks import DirScanJob, PreviewJob, FastDuplicateWorker
 # --- UI & Worker Imports ---
 from ui.widgets import ImageViewer, DualImageViewer, SliderSpinBox
 from workers.tasks import DirScanJob, PreviewJob, FastDuplicateWorker
+
+
+class DuplicateItemWidget(QWidget):
+    """
+    One duplicate item (image + caption) in the grid.
+
+    - Image scales to fill the available space (keeping aspect ratio).
+    - Caption sits directly under the image.
+    - Emits clicked(path, multi_select) when user clicks anywhere on it.
+    """
+
+    clicked = pyqtSignal(str, bool)
+
+    def __init__(self, image_path: str, caption: str, parent: QWidget = None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.caption_text = caption
+        self._orig_pixmap: QPixmap | None = None
+
+        self.setObjectName("dupContainer")  # used by _set_dup_thumb_selected()
+
+        self.image_label = QLabel(self)
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        # Let mouse events go to the parent widget (this one)
+        self.image_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        self.caption_label = QLabel(caption, self)
+        self.caption_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.caption_label.setWordWrap(True)
+        self.caption_label.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.caption_label.setStyleSheet("color:#ccc; font-size: 11px;")
+        self.caption_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        layout.addWidget(self.image_label)
+        layout.addWidget(self.caption_label)
+
+        self._load_pixmap()
+
+    def _load_pixmap(self) -> None:
+        try:
+            pm = QPixmap(self.image_path)
+        except Exception:
+            pm = QPixmap()
+        self._orig_pixmap = pm
+        self._update_scaled_pixmap()
+
+    def _update_scaled_pixmap(self) -> None:
+        if not self._orig_pixmap or self._orig_pixmap.isNull():
+            self.image_label.clear()
+            return
+
+        target_size = self.image_label.size()
+        if target_size.width() <= 0 or target_size.height() <= 0:
+            return
+
+        scaled = self._orig_pixmap.scaled(
+            target_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.image_label.setPixmap(scaled)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_scaled_pixmap()
+
+    def mousePressEvent(self, event) -> None:
+        multi = bool(
+            event.modifiers()
+            & (
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.MetaModifier
+            )
+        )
+        self.clicked.emit(self.image_path, multi)
+        super().mousePressEvent(event)
+
+
+class DupThumbGridContainer(QWidget):
+    """
+    Container for duplicate thumbnails.
+
+    - Holds DuplicateItemWidget instances in a responsive grid.
+    - Chooses number of columns so that we have at most MAX_ROWS rows
+      when there is enough horizontal space.
+    """
+
+    MAX_ROWS = 3
+    MIN_ITEM_WIDTH = 260  # tweak to control density
+
+    def __init__(self, parent: QWidget = None):
+        super().__init__(parent)
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(4, 4, 4, 4)
+        self.grid.setHorizontalSpacing(8)
+        self.grid.setVerticalSpacing(8)
+
+        self._items: List[DuplicateItemWidget] = []
+
+    def clear(self) -> None:
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._items.clear()
+        self.updateGeometry()
+
+    def set_items(self, items: List[DuplicateItemWidget]) -> None:
+        self.clear()
+        self._items = list(items)
+        self._relayout()
+
+    def _relayout(self) -> None:
+        n = len(self._items)
+        if n == 0:
+            return
+
+        width = max(self.width(), 1)
+        max_cols_by_width = max(1, width // self.MIN_ITEM_WIDTH)
+
+        # Start with as many columns as width allows, but not more than number of items.
+        cols = min(max_cols_by_width, n)
+        cols = max(1, cols)
+
+        # Try to keep rows <= MAX_ROWS if possible.
+        rows = math.ceil(n / cols)
+        if rows > self.MAX_ROWS and cols < n:
+            cols = math.ceil(n / self.MAX_ROWS)
+            cols = max(1, min(cols, n))
+            rows = math.ceil(n / cols)
+
+        # Rebuild layout grid positions
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            # do not delete widgets, they are in self._items
+
+        for idx, w in enumerate(self._items):
+            row = idx // cols
+            col = idx % cols
+            self.grid.addWidget(w, row, col)
+
+        self.updateGeometry()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._relayout()
+
 
 
 class ImageEditorApp(QMainWindow):
@@ -389,12 +548,11 @@ class ImageEditorApp(QMainWindow):
         self.dup_scroll = QScrollArea()
         self.dup_scroll.setWidgetResizable(True)
 
-        thumb_container = QWidget()
-        self.dup_thumbs_layout = QGridLayout(thumb_container)
-        self.dup_thumbs_layout.setContentsMargins(4, 4, 4, 4)
-        self.dup_thumbs_layout.setHorizontalSpacing(10)
-        self.dup_thumbs_layout.setVerticalSpacing(10)
-        self.dup_scroll.setWidget(thumb_container)
+        self.dup_thumb_container = DupThumbGridContainer()
+        # keep a reference to the inner layout for compatibility
+        self.dup_thumbs_layout = self.dup_thumb_container.grid
+        self.dup_scroll.setWidget(self.dup_thumb_container)
+
         rv.addWidget(self.dup_scroll, 1)
 
         split.addWidget(right)
@@ -439,7 +597,7 @@ class ImageEditorApp(QMainWindow):
                 self._clear_duplicate_thumbnails()
 
             self.dup_status_lbl.setText("Scanning... 0%")
-            self.dup_scan_button.setEnabled(False)
+            self.dup_scan_button.setEnabled(True)
 
             if mode == "Images":
                 worker = FastDuplicateWorker(self.image_files)
@@ -480,78 +638,38 @@ class ImageEditorApp(QMainWindow):
 
     def _show_duplicate_group_thumbnails(self, group: List[DuplicateRecord]) -> None:
         """
-        Render thumbnails for the given duplicate group.
+        Render thumbnails for the given duplicate group in a dense, responsive grid.
 
-        Supports multi-selection via Ctrl/Cmd-click on thumbnails.
+        - Thumbnails resize with the window (via DuplicateItemWidget).
+        - Caption is directly under the image.
+        - Grid auto-calculates columns so we get up to 3 rows when possible.
         """
         self._clear_duplicate_thumbnails()
-        max_cols = 3
-        row = 0
-        col = 0
-        thumb_size = 320  # large thumbnails
+
+        widgets: List[DuplicateItemWidget] = []
 
         for rec in group:
-            pm = QPixmap(rec.path)
-            if pm.isNull():
-                continue
+            path = rec.path
+            caption = Path(path).name
 
-            pm = pm.scaled(
-                thumb_size,
-                thumb_size,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            item_widget = DuplicateItemWidget(path, caption, parent=self.dup_thumb_container)
 
-            img_label = QLabel()
-            img_label.setPixmap(pm)
-            img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            img_label.setToolTip(rec.path)
-            img_label.setStyleSheet("border: none; background: transparent;")
+            # Keep mapping for selection/highlight logic
+            self._dup_thumb_widgets[path] = item_widget
 
-            text_label = QLabel(Path(rec.path).name)
-            text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            text_label.setWordWrap(True)
-            text_label.setStyleSheet(
-                "border: none; background: transparent; color:#ccc; font-weight: bold;"
-            )
+            # If this path is already selected, restore highlight
+            if path in self._selected_duplicate_paths:
+                self._set_dup_thumb_selected(path, True)
 
-            container = QWidget()
-            container.setObjectName("dupContainer")  # ID for styling
-            v = QVBoxLayout(container)
-            v.setContentsMargins(8, 8, 8, 8)
-            v.setSpacing(4)
-            v.addWidget(img_label)
-            v.addWidget(text_label)
+            # Connect click signal (path + multi_select)
+            item_widget.clicked.connect(self._on_duplicate_thumbnail_clicked)
 
-            self._dup_thumb_widgets[rec.path] = container
+            widgets.append(item_widget)
 
-            # If this path is already in the selection set, re-apply highlight
-            if rec.path in self._selected_duplicate_paths:
-                self._set_dup_thumb_selected(rec.path, True)
+        # Push all items into the responsive grid container
+        if hasattr(self, "dup_thumb_container") and self.dup_thumb_container is not None:
+            self.dup_thumb_container.set_items(widgets)
 
-            self.dup_thumbs_layout.addWidget(container, row, col)
-
-            def _make_click_handler(p: str):
-                def handler(event):
-                    modifiers = event.modifiers()
-                    multi = bool(
-                        modifiers
-                        & (
-                            Qt.KeyboardModifier.ControlModifier
-                            | Qt.KeyboardModifier.MetaModifier
-                        )
-                    )
-                    self._on_duplicate_thumbnail_clicked(p, multi_select=multi)
-                return handler
-
-            img_label.mousePressEvent = _make_click_handler(rec.path)
-            text_label.mousePressEvent = _make_click_handler(rec.path)
-            container.mousePressEvent = _make_click_handler(rec.path)
-
-            col += 1
-            if col >= max_cols:
-                col = 0
-                row += 1
 
     def _video_path_to_pixmap(self, path: str, thumb_size: int) -> Optional[QPixmap]:
         """
@@ -670,20 +788,13 @@ class ImageEditorApp(QMainWindow):
             )
 
     def _clear_duplicate_thumbnails(self) -> None:
-        layout = getattr(self, "dup_thumbs_layout", None)
-        if layout is None:
-            return
-
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
+        if hasattr(self, "dup_thumb_container") and self.dup_thumb_container is not None:
+            self.dup_thumb_container.clear()
 
         self._dup_thumb_widgets.clear()
         self._selected_duplicate_paths.clear()
         self._selected_duplicate_path = None
+
 
     # --- Photos Tab Construction ---
     def _build_photos_tab(self, tab: QWidget):
