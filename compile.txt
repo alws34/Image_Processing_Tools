@@ -1,0 +1,8 @@
+win:
+pyinstaller --noconsole --onefile --name="ImageEditorPro_win" --icon=icon.ico --collect-all pillow_heif main.py
+
+lin: 
+pyinstaller --noconsole --onefile --name="ImageEditorPro" --collect-all pillow_heif main.py
+
+mac: 
+pyinstaller --windowed --name="ImageEditorPro_mac" --collect-all pillow_heif main.py
