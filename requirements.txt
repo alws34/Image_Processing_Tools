@@ -6,4 +6,4 @@ numpy
 pandas
 PyQt6
 piexif
-
+pymediainfo
