@@ -7,21 +7,20 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QListWidget, QSplitter, QScrollArea, QGridLayout,
     QSizePolicy, QCheckBox, QAbstractItemView, QMessageBox, QFileDialog,
-    QMenu
+    QMenu, QFrame
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThreadPool
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThreadPool, QTimer
 from PyQt6.QtGui import (
-    QPixmap, QKeySequence, QAction, QCursor,
-    QPainter, QColor, QPen
+    QPixmap, QKeySequence, QAction, QCursor, 
+    QPainter, QColor, QPen, QImage
 )
 
 # Core / Helpers
-from core.common import SUPPORTED_LIVE_EXTS, pil_to_qpixmap, Image, ImageOps
+from core.common import SUPPORTED_LIVE_EXTS, pil_to_qpixmap, Image, ImageOps, _CV2
 from viewmodels.duplicates_vm import DuplicatesViewModel
 from workers.tasks import ThumbnailLoaderJob
 
 # --- 1. Helper Widget: Individual Thumbnail Item ---
-
 
 class DuplicateItemWidget(QWidget):
     clicked = pyqtSignal(str)          # Left Click
@@ -31,31 +30,28 @@ class DuplicateItemWidget(QWidget):
         super().__init__(parent)
         self.image_path = image_path
         self.is_video = is_video
-
+        
         # UI Setup
-        self.setFixedSize(200, 240)  # Fixed compact size
+        self.setFixedSize(200, 240) # Fixed compact size
 
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setStyleSheet(
-            "background-color: #222; border-radius: 4px;")
-
+        self.image_label.setStyleSheet("background-color: #222; border-radius: 4px;")
+        
         # Ensure image label doesn't disappear
         self.image_label.setMinimumSize(180, 160)
 
-        # Video Badge (Text in caption)
+        # Video Badge
         prefix = "[VIDEO] " if is_video else ""
 
         self.caption_label = QLabel(prefix + caption)
         self.caption_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.caption_label.setWordWrap(True)
-        self.caption_label.setStyleSheet(
-            "font-size: 10px; color: #bbb; line-height: 120%;")
+        self.caption_label.setStyleSheet("font-size: 10px; color: #bbb; line-height: 120%;")
 
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(4, 4, 4, 4)
         vbox.setSpacing(4)
-        # Removed stretch to prevent huge vertical gaps
         vbox.addWidget(self.image_label)
         vbox.addWidget(self.caption_label)
 
@@ -64,7 +60,7 @@ class DuplicateItemWidget(QWidget):
 
         # Set loading state
         self.image_label.setText("Loading...")
-
+        
     def set_selected(self, selected: bool):
         self._selected = selected
         self._update_rendering()
@@ -77,56 +73,46 @@ class DuplicateItemWidget(QWidget):
         else:
             self.image_label.setText("No Preview")
 
-    # ------------------------------------------------------------------ Rendering
-
     def _update_rendering(self):
         """Updates the pixmap with selection overlay if needed."""
         if not self._orig_pixmap:
             return
 
-        # 1. Determine size to scale to
         size = self.image_label.size()
         if size.width() <= 10:
-            size = QSize(180, 160)  # Default fallback
+            size = QSize(180, 160)
 
-        # 2. Scale Image
         pm = self._orig_pixmap.scaled(
             size,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
 
-        # 3. Apply Blue Overlay if selected
         if self._selected:
             result = QPixmap(pm.size())
             result.fill(Qt.GlobalColor.transparent)
-
+            
             painter = QPainter(result)
             painter.drawPixmap(0, 0, pm)
-
-            # Draw Blue Overlay (R, G, B, Alpha)
-            painter.fillRect(result.rect(), QColor(0, 150, 255, 100))
-
+            
+            # Draw Blue Overlay
+            painter.fillRect(result.rect(), QColor(0, 150, 255, 100)) 
+            
             # Blue Border
-            # FIX: Create QPen object correctly
             pen = QPen(QColor(0, 150, 255))
-            pen.setWidth(6)  # Thicker border for visibility
+            pen.setWidth(6)
             painter.setPen(pen)
-
-            # Draw rect inside the boundary so it doesn't clip
+            
             rect = result.rect()
-            rect.adjust(2, 2, -2, -2)
+            rect.adjust(2, 2, -2, -2) 
             painter.drawRect(rect)
-
+            
             painter.end()
             self.image_label.setPixmap(result)
-
-            self.caption_label.setStyleSheet(
-                "font-size: 10px; color: #66ccff; font-weight: bold;")
-            self.setStyleSheet(
-                "background-color: #2a2a2a; border-radius: 6px;")
+            
+            self.caption_label.setStyleSheet("font-size: 10px; color: #66ccff; font-weight: bold;")
+            self.setStyleSheet("background-color: #2a2a2a; border-radius: 6px;")
         else:
-            # Normal State
             self.image_label.setPixmap(pm)
             self.caption_label.setStyleSheet("font-size: 10px; color: #bbb;")
             self.setStyleSheet("background-color: transparent;")
@@ -154,8 +140,7 @@ class DupThumbGridContainer(QWidget):
         self.grid = QGridLayout(self)
         self.grid.setContentsMargins(10, 10, 10, 10)
         self.grid.setSpacing(10)
-        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop |
-                               Qt.AlignmentFlag.AlignLeft)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self._widgets = []
 
     def clear_items(self):
@@ -170,7 +155,6 @@ class DupThumbGridContainer(QWidget):
         self._relayout()
 
     def _relayout(self):
-        # Detach all
         for i in reversed(range(self.grid.count())):
             self.grid.itemAt(i).widget().setParent(None)
 
@@ -196,9 +180,16 @@ class DuplicatesTab(QWidget):
     def __init__(self, vm: DuplicatesViewModel, parent=None):
         super().__init__(parent)
         self.vm = vm
-        self.threadpool = QThreadPool()
+        self.threadpool = QThreadPool() 
 
         self._thumb_widgets: dict[str, DuplicateItemWidget] = {}
+        
+        # Video Playback State
+        self.cap = None
+        self.video_timer = QTimer()
+        self.video_timer.timeout.connect(self._on_video_tick)
+        self.is_playing = False
+        self.current_preview_path = None
 
         self._init_ui()
         self._wire_vm()
@@ -278,15 +269,23 @@ class DuplicatesTab(QWidget):
         self.lbl_preview_title = QLabel("Preview")
         self.lbl_preview_img = QLabel()
         self.lbl_preview_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_preview_img.setMinimumSize(200, 200)
+        self.lbl_preview_img.setMinimumSize(320, 240)
         self.lbl_preview_img.setStyleSheet("background-color: black;")
 
         self.scroll_preview = QScrollArea()
         self.scroll_preview.setWidgetResizable(True)
         self.scroll_preview.setWidget(self.lbl_preview_img)
+        
+        # Play/Pause Button for Video
+        self.btn_preview_play = QPushButton("Play Video")
+        self.btn_preview_play.setCheckable(True)
+        self.btn_preview_play.clicked.connect(self._toggle_video_playback)
+        self.btn_preview_play.setVisible(False) # Hidden for images
 
         right_layout.addWidget(self.lbl_preview_title)
         right_layout.addWidget(self.scroll_preview)
+        right_layout.addWidget(self.btn_preview_play)
+        
         splitter.addWidget(right_panel)
 
         splitter.setStretchFactor(0, 1)
@@ -334,6 +333,7 @@ class DuplicatesTab(QWidget):
     # ------------------------------------------------------------------ Event handlers
 
     def _on_scan_started(self):
+        self.stop_video_preview()
         self.lbl_status.setText("Scanning...")
         self.btn_scan.setEnabled(False)
         self.list_groups.clear()
@@ -353,12 +353,13 @@ class DuplicatesTab(QWidget):
     def _refresh_group_list(self):
         # Restore selection index to avoid jumping to top
         current_idx = self.list_groups.currentRow()
-
+        
         self.list_groups.clear()
         self.grid_container.clear_items()
         self._thumb_widgets.clear()
         self.lbl_preview_img.clear()
         self.lbl_preview_title.setText("Preview")
+        self.stop_video_preview()
 
         count = len(self.vm.duplicate_groups)
         for i, group in enumerate(self.vm.duplicate_groups):
@@ -370,7 +371,6 @@ class DuplicatesTab(QWidget):
             self.list_groups.addItem(name)
 
         if count > 0:
-            # Restore previous index if valid, else clamp
             if current_idx >= 0 and current_idx < count:
                 self.list_groups.setCurrentRow(current_idx)
             else:
@@ -379,19 +379,21 @@ class DuplicatesTab(QWidget):
     def _load_group_thumbs(self, row):
         if row < 0 or row >= len(self.vm.duplicate_groups):
             return
+        
+        # Stop any playing video from previous group
+        self.stop_video_preview()
 
         group = self.vm.duplicate_groups[row]
         self.grid_container.clear_items()
         self._thumb_widgets.clear()
 
-        # 1. Create Widgets
+        # 1. Create Widgets 
         for rec in group:
             p = Path(rec.path)
             is_video = p.suffix.lower() in SUPPORTED_LIVE_EXTS
 
             try:
                 size_mb = p.stat().st_size / (1024*1024)
-                # Show Parent Folder Name
                 caption = f"[{p.parent.name}]\n{p.name}\n{size_mb:.1f} MB"
             except:
                 caption = p.name
@@ -427,7 +429,7 @@ class DuplicatesTab(QWidget):
         act_keep = QAction("Keep This One (Select Others for Deletion)", self)
         act_keep.triggered.connect(lambda: self._on_keep_this(path))
         menu.addAction(act_keep)
-
+        
         act_open = QAction("Reveal in Explorer/Finder", self)
         act_open.triggered.connect(lambda: self._reveal_in_os(path))
         menu.addAction(act_open)
@@ -438,9 +440,7 @@ class DuplicatesTab(QWidget):
         self.vm.select_all_except(row, keep_path)
 
     def _reveal_in_os(self, path):
-        import subprocess
-        import platform
-        import os
+        import subprocess, platform, os
         p = Path(path).parent
         if platform.system() == "Windows":
             os.startfile(p)
@@ -449,31 +449,109 @@ class DuplicatesTab(QWidget):
         else:
             subprocess.Popen(["xdg-open", str(p)])
 
-    def _show_preview(self, path):
-        self.lbl_preview_title.setText(Path(path).name)
+    # ------------------------------------------------------------------ Preview Logic
 
-        # FIX: Use Pillow to load for HEIC support
+    def _show_preview(self, path):
+        # 1. Check if same file is already loaded
+        if self.current_preview_path == path:
+            return
+            
+        self.stop_video_preview()
+        self.current_preview_path = path
+        self.lbl_preview_title.setText(Path(path).name)
+        
+        ext = Path(path).suffix.lower()
+        
+        # VIDEO Handling
+        if ext in SUPPORTED_LIVE_EXTS:
+            self.btn_preview_play.setVisible(True)
+            self.btn_preview_play.setText("Play Video")
+            self.btn_preview_play.setChecked(False)
+            self._load_video_preview(path)
+            return
+
+        # IMAGE Handling
+        self.btn_preview_play.setVisible(False)
         try:
             with Image.open(path) as im:
                 im = ImageOps.exif_transpose(im)
-                # Convert to RGBA for Qt
                 if im.mode != "RGBA":
                     im = im.convert("RGBA")
-
-                # Convert to QPixmap
                 qimg = pil_to_qpixmap(im)
-
-                # Render to label
+                
                 target = self.scroll_preview.viewport().size()
                 if target.width() > 0:
                     self.lbl_preview_img.setPixmap(
                         qimg.scaled(target, Qt.AspectRatioMode.KeepAspectRatio,
-                                    Qt.TransformationMode.SmoothTransformation)
+                                  Qt.TransformationMode.SmoothTransformation)
                     )
                 else:
                     self.lbl_preview_img.setPixmap(qimg)
         except Exception as e:
             self.lbl_preview_img.setText(f"Preview Error\n{str(e)}")
+
+    def _load_video_preview(self, path):
+        if _CV2 is None:
+            self.lbl_preview_img.setText("OpenCV not installed.")
+            return
+
+        self.cap = _CV2.VideoCapture(path)
+        if self.cap.isOpened():
+            # Show first frame
+            ret, frame = self.cap.read()
+            if ret:
+                self._display_cv_frame(frame)
+                # Reset to start
+                self.cap.set(_CV2.CAP_PROP_POS_FRAMES, 0)
+        else:
+            self.lbl_preview_img.setText("Cannot load video.")
+
+    def _toggle_video_playback(self):
+        if not self.cap or not self.cap.isOpened():
+            return
+            
+        if self.is_playing:
+            self.video_timer.stop()
+            self.btn_preview_play.setText("Play Video")
+            self.is_playing = False
+        else:
+            self.video_timer.start(33) # ~30 FPS
+            self.btn_preview_play.setText("Pause Video")
+            self.is_playing = True
+
+    def _on_video_tick(self):
+        if not self.cap:
+            return
+        
+        ret, frame = self.cap.read()
+        if ret:
+            self._display_cv_frame(frame)
+        else:
+            # Loop
+            self.cap.set(_CV2.CAP_PROP_POS_FRAMES, 0)
+
+    def _display_cv_frame(self, frame):
+        # Convert BGR (OpenCV) to RGB (Qt)
+        rgb = _CV2.cvtColor(frame, _CV2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        pix = QPixmap.fromImage(qimg)
+        
+        target = self.scroll_preview.viewport().size()
+        if target.width() > 0:
+            pix = pix.scaled(target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        
+        self.lbl_preview_img.setPixmap(pix)
+
+    def stop_video_preview(self):
+        self.video_timer.stop()
+        self.is_playing = False
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        self.current_preview_path = None
+        self.btn_preview_play.setVisible(False)
 
     def _update_highlights(self):
         for path, widget in self._thumb_widgets.items():
@@ -497,7 +575,6 @@ class DuplicatesTab(QWidget):
         self.vm.select_all_in_group(row)
 
     def on_delete_request(self):
-        """Called by MainWindow via global delete key or local button."""
         paths = self.vm.get_paths_to_delete()
         if not paths:
             return
