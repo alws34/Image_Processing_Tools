@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import shutil
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -43,6 +44,7 @@ class ImageEditorApp(QMainWindow):
 
         self._init_top_bar()
         self._init_tabs()
+        self._init_bottom_bar()  # New Bottom Bar
         self._init_shortcuts()
 
     def _init_top_bar(self):
@@ -85,6 +87,22 @@ class ImageEditorApp(QMainWindow):
         # Stop video when switching away from Live tab
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
+    def _init_bottom_bar(self):
+        """Initializes the bottom bar with the Clean Deleted button."""
+        bottom_layout = QHBoxLayout()
+        bottom_layout.setContentsMargins(0, 4, 0, 0)
+        
+        # Spacer to push button to the right
+        bottom_layout.addStretch(1)
+        
+        self.btn_clean = QPushButton("Clean Deleted Folders")
+        self.btn_clean.setToolTip("Permanently remove all folders named 'deleted' in the current directory.")
+        self.btn_clean.setStyleSheet("background-color: #442222; color: #ff9999; font-weight: bold; border: 1px solid #773333; padding: 5px 10px;")
+        self.btn_clean.clicked.connect(self._clean_deleted_folders)
+        
+        bottom_layout.addWidget(self.btn_clean)
+        self.main_layout.addLayout(bottom_layout)
+
     def _init_shortcuts(self):
         # Delete Action (Global)
         self.delete_action = QAction("Delete", self)
@@ -115,13 +133,52 @@ class ImageEditorApp(QMainWindow):
     def _handle_global_delete(self):
         """Routes the delete key to the active tab."""
         current = self.tabs.currentWidget()
-        # Duplicates tab handles its own shortcuts via widget focus,
-        # but if the main window catches it, we can route it manually if needed.
-        # However, DuplicatesTab usually has 'focus' when you click items.
-        # We'll prioritize the Photos/Live tab for this specific shortcut logic
-        # unless we want to make it generic.
         if hasattr(current, "on_delete_request"):
             current.on_delete_request()
+
+    def _clean_deleted_folders(self):
+        """
+        Recursively finds and deletes all folders named 'deleted'.
+        Equivalent to: find . -name "deleted" -type d -prune -exec rm -rf {} +
+        """
+        if not self.current_folder or not self.current_folder.exists():
+            QMessageBox.warning(self, "Error", "No valid folder selected.")
+            return
+
+        # Warning Dialog
+        reply = QMessageBox.warning(
+            self, 
+            "Irreversible Cleanup", 
+            f"Are you sure you want to permanently delete all 'deleted' folders inside:\n{self.current_folder}\n\nTHIS ACTION CANNOT BE UNDONE.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        count = 0
+        try:
+            # Walk top-down so we can modify 'dirs' in-place (pruning)
+            for root, dirs, files in os.walk(self.current_folder, topdown=True):
+                if "deleted" in dirs:
+                    target_path = Path(root) / "deleted"
+                    try:
+                        shutil.rmtree(target_path)
+                        count += 1
+                    except Exception as e:
+                        print(f"Failed to delete {target_path}: {e}")
+                    
+                    # Remove 'deleted' from dirs so os.walk doesn't try to enter it
+                    dirs.remove("deleted")
+            
+            QMessageBox.information(self, "Cleanup Complete", f"Successfully removed {count} 'deleted' folders.")
+            
+            # Optional: Refresh current view if needed
+            # self._load_folder_globally(str(self.current_folder))
+
+        except Exception as e:
+            QMessageBox.critical(self, "Cleanup Error", str(e))
 
     # --- Folder Loading ---
 
@@ -165,8 +222,6 @@ class ImageEditorApp(QMainWindow):
         self.tab_live.populate(movs)
 
         # Update Duplicates Tab Status
-        # The duplicates tab status is now mostly driven by the VM signals,
-        # but we can set an initial text.
         self.tab_dupes.lbl_status.setText(
             f"Folder loaded: {self.current_folder.name}. Found {len(images)} images, {len(movs)} videos."
         )
