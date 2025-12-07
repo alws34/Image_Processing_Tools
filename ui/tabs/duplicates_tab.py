@@ -211,6 +211,7 @@ class DuplicatesTab(QWidget):
 
         self.chk_recursive = QCheckBox("Recursive")
         self.chk_exact = QCheckBox("Exact match (slow)")
+        self.chk_exact.setChecked(True)
 
         self.btn_scan = QPushButton("Scan Duplicates")
         self.btn_scan.setStyleSheet(
@@ -280,7 +281,7 @@ class DuplicatesTab(QWidget):
         self.btn_preview_play = QPushButton("Play Video")
         self.btn_preview_play.setCheckable(True)
         self.btn_preview_play.clicked.connect(self._toggle_video_playback)
-        self.btn_preview_play.setVisible(False) # Hidden for images
+        self.btn_preview_play.setVisible(False) 
 
         right_layout.addWidget(self.lbl_preview_title)
         right_layout.addWidget(self.scroll_preview)
@@ -294,6 +295,12 @@ class DuplicatesTab(QWidget):
 
         # Bottom bar
         bottom_bar = QHBoxLayout()
+        
+        # Auto-Mark Button
+        self.btn_auto_mark = QPushButton("Auto-Mark Copies")
+        self.btn_auto_mark.setToolTip("Selects files with 'copy' suffixes (e.g. ' 2', '(1)') for deletion if an original exists in the same folder.")
+        self.btn_auto_mark.clicked.connect(self._auto_mark_copies)
+
         self.btn_export = QPushButton("Export List")
         self.btn_delete = QPushButton("Delete Selected")
         self.btn_delete.setStyleSheet("color: #ffcccc; font-weight: bold;")
@@ -301,6 +308,7 @@ class DuplicatesTab(QWidget):
 
         self.lbl_status = QLabel("Ready.")
 
+        bottom_bar.addWidget(self.btn_auto_mark) 
         bottom_bar.addWidget(self.btn_export)
         bottom_bar.addStretch(1)
         bottom_bar.addWidget(self.lbl_status)
@@ -351,7 +359,6 @@ class DuplicatesTab(QWidget):
         self.btn_scan.setEnabled(True)
 
     def _refresh_group_list(self):
-        # Restore selection index to avoid jumping to top
         current_idx = self.list_groups.currentRow()
         
         self.list_groups.clear()
@@ -380,7 +387,6 @@ class DuplicatesTab(QWidget):
         if row < 0 or row >= len(self.vm.duplicate_groups):
             return
         
-        # Stop any playing video from previous group
         self.stop_video_preview()
 
         group = self.vm.duplicate_groups[row]
@@ -452,7 +458,6 @@ class DuplicatesTab(QWidget):
     # ------------------------------------------------------------------ Preview Logic
 
     def _show_preview(self, path):
-        # 1. Check if same file is already loaded
         if self.current_preview_path == path:
             return
             
@@ -462,7 +467,6 @@ class DuplicatesTab(QWidget):
         
         ext = Path(path).suffix.lower()
         
-        # VIDEO Handling
         if ext in SUPPORTED_LIVE_EXTS:
             self.btn_preview_play.setVisible(True)
             self.btn_preview_play.setText("Play Video")
@@ -470,7 +474,6 @@ class DuplicatesTab(QWidget):
             self._load_video_preview(path)
             return
 
-        # IMAGE Handling
         self.btn_preview_play.setVisible(False)
         try:
             with Image.open(path) as im:
@@ -497,11 +500,9 @@ class DuplicatesTab(QWidget):
 
         self.cap = _CV2.VideoCapture(path)
         if self.cap.isOpened():
-            # Show first frame
             ret, frame = self.cap.read()
             if ret:
                 self._display_cv_frame(frame)
-                # Reset to start
                 self.cap.set(_CV2.CAP_PROP_POS_FRAMES, 0)
         else:
             self.lbl_preview_img.setText("Cannot load video.")
@@ -515,7 +516,7 @@ class DuplicatesTab(QWidget):
             self.btn_preview_play.setText("Play Video")
             self.is_playing = False
         else:
-            self.video_timer.start(33) # ~30 FPS
+            self.video_timer.start(33) 
             self.btn_preview_play.setText("Pause Video")
             self.is_playing = True
 
@@ -527,11 +528,9 @@ class DuplicatesTab(QWidget):
         if ret:
             self._display_cv_frame(frame)
         else:
-            # Loop
             self.cap.set(_CV2.CAP_PROP_POS_FRAMES, 0)
 
     def _display_cv_frame(self, frame):
-        # Convert BGR (OpenCV) to RGB (Qt)
         rgb = _CV2.cvtColor(frame, _CV2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
@@ -573,6 +572,13 @@ class DuplicatesTab(QWidget):
     def _on_select_all_group(self):
         row = self.list_groups.currentRow()
         self.vm.select_all_in_group(row)
+        
+    def _auto_mark_copies(self):
+        count = self.vm.mark_same_dir_copies()
+        if count > 0:
+            QMessageBox.information(self, "Auto-Mark", f"Marked {count} copy files for deletion.\n\nPlease review blue items, then click 'Delete Selected' to confirm.")
+        else:
+            QMessageBox.information(self, "Auto-Mark", "No 'same-directory' copy files found.")
 
     def on_delete_request(self):
         paths = self.vm.get_paths_to_delete()

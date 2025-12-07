@@ -30,8 +30,8 @@ import numpy as np
 import os
 from .duplicates import DuplicateRecord
 from PyQt6.QtCore import  QRunnable, pyqtSlot, QObject, pyqtSignal
-from core.common import (
-    Image, ImageOps, ImageEnhance, _CV2, _NP, _HEIF_PLUGIN, _PIEXIF, _S2T, _MEDIAINFO,)
+from .common import (
+    Image, ImageOps, ImageEnhance, _CV2, _NP, _HEIF_PLUGIN, _PIEXIF, _MEDIAINFO,)
 class VideoDuplicateWorkerSignals(QObject):
     progress = pyqtSignal(int)
     finished = pyqtSignal(list, str)
