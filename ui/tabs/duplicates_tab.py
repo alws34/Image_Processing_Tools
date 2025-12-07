@@ -9,16 +9,73 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QCheckBox, QAbstractItemView, QMessageBox, QFileDialog,
     QMenu, QFrame
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThreadPool, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QThreadPool, QTimer, QEvent, QRunnable, QObject
 from PyQt6.QtGui import (
     QPixmap, QKeySequence, QAction, QCursor, 
-    QPainter, QColor, QPen, QImage
+    QPainter, QColor, QPen, QImage, QKeyEvent
 )
 
 # Core / Helpers
 from core.common import SUPPORTED_LIVE_EXTS, pil_to_qpixmap, Image, ImageOps, _CV2
 from viewmodels.duplicates_vm import DuplicatesViewModel
 from workers.tasks import ThumbnailLoaderJob
+
+# --- 0. Async Preview Loader ---
+
+class PreviewSignals(QObject):
+    loaded = pyqtSignal(str, object) # path, QPixmap (or None)
+
+class PreviewLoaderJob(QRunnable):
+    """
+    Background job to load the large preview image/video frame.
+    This prevents the UI from freezing when clicking items.
+    """
+    def __init__(self, path: str, target_size: QSize, is_video: bool):
+        super().__init__()
+        self.path = path
+        self.target_size = target_size
+        self.is_video = is_video
+        self.signals = PreviewSignals()
+
+    def run(self):
+        try:
+            pixmap = None
+            
+            if self.is_video:
+                if _CV2 is not None:
+                    cap = _CV2.VideoCapture(self.path)
+                    if cap.isOpened():
+                        ret, frame = cap.read()
+                        cap.release()
+                        if ret and frame is not None:
+                            rgb = _CV2.cvtColor(frame, _CV2.COLOR_BGR2RGB)
+                            h, w, ch = rgb.shape
+                            qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+                            pixmap = QPixmap.fromImage(qimg)
+            else:
+                # Image
+                with Image.open(self.path) as im:
+                    im = ImageOps.exif_transpose(im)
+                    if im.mode != "RGBA":
+                        im = im.convert("RGBA")
+                    
+                    # Pre-scale in PIL for speed if it's huge, but keep quality high
+                    # We usually want to fit within the view
+                    w, h = im.size
+                    # Cap max load size to something reasonable (e.g. 2000px) to save RAM/Time
+                    if max(w, h) > 2500:
+                        im.thumbnail((2500, 2500), Image.Resampling.LANCZOS)
+                    
+                    qimg = pil_to_qpixmap(im)
+                    pixmap = qimg # Convert to pixmap on main thread usually better, but QImage is safe
+            
+            self.signals.loaded.emit(self.path, pixmap)
+            
+        except Exception as e:
+            # On error, just emit None
+            print(f"Preview load error: {e}")
+            self.signals.loaded.emit(self.path, None)
+
 
 # --- 1. Helper Widget: Individual Thumbnail Item ---
 
@@ -57,44 +114,55 @@ class DuplicateItemWidget(QWidget):
 
         self._selected = False
         self._orig_pixmap = None
+        self._cached_scaled_pixmap = None
+        self._last_size = QSize(0, 0)
 
         # Set loading state
         self.image_label.setText("Loading...")
         
     def set_selected(self, selected: bool):
-        self._selected = selected
-        self._update_rendering()
+        if self._selected != selected:
+            self._selected = selected
+            self._update_overlay_only()
 
     def set_thumbnail(self, qimg):
         """Called by the async loader when the image is ready."""
         if qimg:
             self._orig_pixmap = QPixmap.fromImage(qimg)
-            self._update_rendering()
+            self._update_base_rendering()
         else:
             self.image_label.setText("No Preview")
 
-    def _update_rendering(self):
-        """Updates the pixmap with selection overlay if needed."""
+    def _update_base_rendering(self):
+        """Re-scales the base image. Called on load or resize."""
         if not self._orig_pixmap:
             return
 
         size = self.image_label.size()
         if size.width() <= 10:
             size = QSize(180, 160)
+        
+        # Only re-scale if size changed significantly
+        if self._cached_scaled_pixmap is None or size != self._last_size:
+            self._cached_scaled_pixmap = self._orig_pixmap.scaled(
+                size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._last_size = size
+        
+        self._update_overlay_only()
 
-        pm = self._orig_pixmap.scaled(
-            size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+    def _update_overlay_only(self):
+        """Draws the blue overlay on top of the cached scaled image. Fast."""
+        if not self._cached_scaled_pixmap:
+            return
 
         if self._selected:
-            result = QPixmap(pm.size())
-            result.fill(Qt.GlobalColor.transparent)
+            # Copy cached pixmap to draw overlay
+            result = QPixmap(self._cached_scaled_pixmap)
             
             painter = QPainter(result)
-            painter.drawPixmap(0, 0, pm)
-            
             # Draw Blue Overlay
             painter.fillRect(result.rect(), QColor(0, 150, 255, 100)) 
             
@@ -104,7 +172,7 @@ class DuplicateItemWidget(QWidget):
             painter.setPen(pen)
             
             rect = result.rect()
-            rect.adjust(2, 2, -2, -2) 
+            rect.adjust(3, 3, -3, -3) 
             painter.drawRect(rect)
             
             painter.end()
@@ -113,13 +181,14 @@ class DuplicateItemWidget(QWidget):
             self.caption_label.setStyleSheet("font-size: 10px; color: #66ccff; font-weight: bold;")
             self.setStyleSheet("background-color: #2a2a2a; border-radius: 6px;")
         else:
-            self.image_label.setPixmap(pm)
+            # Just show cached pixmap
+            self.image_label.setPixmap(self._cached_scaled_pixmap)
             self.caption_label.setStyleSheet("font-size: 10px; color: #bbb;")
             self.setStyleSheet("background-color: transparent;")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._update_rendering()
+        self._update_base_rendering()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -190,6 +259,7 @@ class DuplicatesTab(QWidget):
         self.video_timer.timeout.connect(self._on_video_tick)
         self.is_playing = False
         self.current_preview_path = None
+        self.pending_preview_path = None # For async tracking
 
         self._init_ui()
         self._wire_vm()
@@ -256,6 +326,9 @@ class DuplicatesTab(QWidget):
 
         self.scroll_thumbs = QScrollArea()
         self.scroll_thumbs.setWidgetResizable(True)
+        # IMPORTANT: Install event filter to capture arrow keys from the scroll area
+        self.scroll_thumbs.installEventFilter(self)
+        
         self.grid_container = DupThumbGridContainer()
         self.scroll_thumbs.setWidget(self.grid_container)
 
@@ -297,7 +370,7 @@ class DuplicatesTab(QWidget):
         bottom_bar = QHBoxLayout()
         
         # Auto-Mark Button
-        self.btn_auto_mark = QPushButton("Auto-Mark Copies")
+        self.btn_auto_mark = QPushButton("Auto-Mark Same Dir")
         self.btn_auto_mark.setToolTip("Selects files with 'copy' suffixes (e.g. ' 2', '(1)') for deletion if an original exists in the same folder.")
         self.btn_auto_mark.clicked.connect(self._auto_mark_copies)
 
@@ -316,6 +389,50 @@ class DuplicatesTab(QWidget):
         bottom_bar.addWidget(self.btn_delete)
 
         layout.addLayout(bottom_bar)
+        
+        # Ensure focus policy allows capturing keys
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    # ------------------------------------------------------------------ Keyboard & Event Filter
+
+    def keyPressEvent(self, event: QKeyEvent):
+        """Handle Global Key Presses in this tab."""
+        self._handle_navigation_keys(event)
+        super().keyPressEvent(event)
+
+    def eventFilter(self, source, event):
+        """Intercept arrow keys from child widgets (like ScrollArea) to navigate groups."""
+        if event.type() == QEvent.Type.KeyPress:
+            if self._handle_navigation_keys(event):
+                return True # Event consumed
+        return super().eventFilter(source, event)
+
+    def _handle_navigation_keys(self, event: QKeyEvent) -> bool:
+        key = event.key()
+        
+        # 1. Navigation (Up/Down) -> Change Group
+        if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            row = self.list_groups.currentRow()
+            count = self.list_groups.count()
+            
+            if count == 0:
+                return False
+
+            if key == Qt.Key.Key_Up:
+                new_row = max(0, row - 1)
+            else:
+                new_row = min(count - 1, row + 1)
+
+            if new_row != row:
+                self.list_groups.setCurrentRow(new_row)
+            return True # We handled it
+            
+        # 2. Deletion
+        if key == Qt.Key.Key_Delete:
+            self.on_delete_request()
+            return True
+
+        return False
 
     # ------------------------------------------------------------------ VM wiring
 
@@ -418,17 +535,19 @@ class DuplicatesTab(QWidget):
 
         self._update_highlights()
 
-        # Auto-preview first item
+        # Auto-preview first item (Async)
         if group:
-            self._show_preview(group[0].path)
+            self._request_preview(group[0].path)
 
     def _on_thumb_loaded(self, path, qimg):
         if path in self._thumb_widgets:
             self._thumb_widgets[path].set_thumbnail(qimg)
 
     def _on_thumb_clicked(self, path):
+        # Immediate UI feedback handled by _update_highlights via VM signal
+        # but VM logic is fast. The preview loading is what was slow.
         self.vm.toggle_selection(path)
-        self._show_preview(path)
+        self._request_preview(path)
 
     def _on_thumb_right_clicked(self, path):
         menu = QMenu(self)
@@ -455,62 +574,73 @@ class DuplicatesTab(QWidget):
         else:
             subprocess.Popen(["xdg-open", str(p)])
 
-    # ------------------------------------------------------------------ Preview Logic
+    # ------------------------------------------------------------------ Async Preview Logic
 
-    def _show_preview(self, path):
+    def _request_preview(self, path):
         if self.current_preview_path == path:
             return
             
         self.stop_video_preview()
         self.current_preview_path = path
+        self.pending_preview_path = path # Track what we want
+        
         self.lbl_preview_title.setText(Path(path).name)
+        self.lbl_preview_img.setText("Loading Preview...")
         
+        # Check Video
         ext = Path(path).suffix.lower()
-        
         if ext in SUPPORTED_LIVE_EXTS:
             self.btn_preview_play.setVisible(True)
             self.btn_preview_play.setText("Play Video")
             self.btn_preview_play.setChecked(False)
-            self._load_video_preview(path)
+            
+            # For video, we still use the async loader for the first frame
+            job = PreviewLoaderJob(path, self.scroll_preview.viewport().size(), is_video=True)
+            job.signals.loaded.connect(self._on_preview_loaded)
+            self.threadpool.start(job)
             return
 
+        # Image
         self.btn_preview_play.setVisible(False)
-        try:
-            with Image.open(path) as im:
-                im = ImageOps.exif_transpose(im)
-                if im.mode != "RGBA":
-                    im = im.convert("RGBA")
-                qimg = pil_to_qpixmap(im)
-                
-                target = self.scroll_preview.viewport().size()
-                if target.width() > 0:
-                    self.lbl_preview_img.setPixmap(
-                        qimg.scaled(target, Qt.AspectRatioMode.KeepAspectRatio,
-                                  Qt.TransformationMode.SmoothTransformation)
-                    )
-                else:
-                    self.lbl_preview_img.setPixmap(qimg)
-        except Exception as e:
-            self.lbl_preview_img.setText(f"Preview Error\n{str(e)}")
+        job = PreviewLoaderJob(path, self.scroll_preview.viewport().size(), is_video=False)
+        job.signals.loaded.connect(self._on_preview_loaded)
+        self.threadpool.start(job)
 
-    def _load_video_preview(self, path):
-        if _CV2 is None:
-            self.lbl_preview_img.setText("OpenCV not installed.")
+    def _on_preview_loaded(self, path, pixmap):
+        # Ignore if the user has already clicked another image
+        if path != self.pending_preview_path:
             return
-
-        self.cap = _CV2.VideoCapture(path)
-        if self.cap.isOpened():
-            ret, frame = self.cap.read()
-            if ret:
-                self._display_cv_frame(frame)
-                self.cap.set(_CV2.CAP_PROP_POS_FRAMES, 0)
+            
+        if pixmap and not pixmap.isNull():
+            # Scale to fit if needed
+            target = self.scroll_preview.viewport().size()
+            if target.width() > 0:
+                scaled = pixmap.scaled(target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                self.lbl_preview_img.setPixmap(scaled)
+            else:
+                self.lbl_preview_img.setPixmap(pixmap)
+            
+            # If video, prepare player (but don't play yet)
+            ext = Path(path).suffix.lower()
+            if ext in SUPPORTED_LIVE_EXTS:
+                 self._prepare_video_player(path)
         else:
-            self.lbl_preview_img.setText("Cannot load video.")
+            self.lbl_preview_img.setText("Preview Failed")
+
+    def _prepare_video_player(self, path):
+        if _CV2 is None: return
+        self.cap = _CV2.VideoCapture(path)
+        # We already showed the first frame via the async loader
 
     def _toggle_video_playback(self):
         if not self.cap or not self.cap.isOpened():
+            # Try reloading if missing (e.g. if async loader finished but player wasn't ready)
+            if self.current_preview_path:
+                self._prepare_video_player(self.current_preview_path)
+        
+        if not self.cap or not self.cap.isOpened():
             return
-            
+
         if self.is_playing:
             self.video_timer.stop()
             self.btn_preview_play.setText("Play Video")
@@ -521,9 +651,7 @@ class DuplicatesTab(QWidget):
             self.is_playing = True
 
     def _on_video_tick(self):
-        if not self.cap:
-            return
-        
+        if not self.cap: return
         ret, frame = self.cap.read()
         if ret:
             self._display_cv_frame(frame)
@@ -533,14 +661,12 @@ class DuplicatesTab(QWidget):
     def _display_cv_frame(self, frame):
         rgb = _CV2.cvtColor(frame, _CV2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
         pix = QPixmap.fromImage(qimg)
         
         target = self.scroll_preview.viewport().size()
         if target.width() > 0:
             pix = pix.scaled(target, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        
         self.lbl_preview_img.setPixmap(pix)
 
     def stop_video_preview(self):
@@ -549,7 +675,6 @@ class DuplicatesTab(QWidget):
         if self.cap:
             self.cap.release()
             self.cap = None
-        self.current_preview_path = None
         self.btn_preview_play.setVisible(False)
 
     def _update_highlights(self):
